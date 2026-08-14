@@ -18,8 +18,7 @@ public:
 private:
   bool isEngaged;
   unsigned long engagedTime;
-  const unsigned long maxEngageDuration =
-      5000; // 5 seconds max to prevent burning out the coil
+  const unsigned long maxEngageDuration = 5000; // 5 seconds max to prevent burning out the coil
 };
 
 #endif // SOLENOID_CONTROLLER_H

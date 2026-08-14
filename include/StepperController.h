@@ -1,6 +1,7 @@
 #ifndef STEPPER_CONTROLLER_H
 #define STEPPER_CONTROLLER_H
 
+#include <AccelStepper.h>
 #include <Arduino.h>
 
 class StepperController {
@@ -9,31 +10,20 @@ public:
 
   void begin();
 
-  // Commands the stepper to move to a target encoder position
+  // Commands the stepper to move to an absolute step position
   void moveTo(long targetPosition);
 
-  // Must be called in the main loop to keep the motor moving
+  // Must be called in the main loop — drives the AccelStepper state machine
   void update();
 
-  // Checks if the motor has reached its target
+  // True while the motor is still traveling to the target
   bool isMoving();
 
-  // Returns current encoder position
+  // Returns the current step-counted position
   long getPosition();
 
-  // Interrupt Service Routines for the encoder
-  static void IRAM_ATTR isrA();
-  static void IRAM_ATTR isrB();
-
 private:
-  void stepMotor(bool direction);
-
-  static volatile long currentPosition;
-  long targetPosition;
-  bool moving;
-
-  unsigned long lastStepTime;
-  const unsigned long stepInterval = 1000; // Microseconds between steps (speed)
+  AccelStepper motor;
 };
 
 #endif // STEPPER_CONTROLLER_H

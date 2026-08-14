@@ -16,9 +16,8 @@ void SolenoidController::actuate(bool engage) {
     if (engage) {
         digitalWrite(SOLENOID_RELAY_PIN, HIGH);
         engagedTime = millis();
-    } else {
-        digitalWrite(SOLENOID_RELAY_PIN, LOW);
     }
+    else digitalWrite(SOLENOID_RELAY_PIN, LOW);
 }
 
 void SolenoidController::update() {

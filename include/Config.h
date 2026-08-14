@@ -7,13 +7,11 @@
 #define COMM_BAUD_RATE 115200
 
 // --- Stepper Motor (A4988) ---
-#define STEPPER_DIR_PIN 25
 #define STEPPER_STEP_PIN 26
+#define STEPPER_DIR_PIN 25
 #define STEPPER_EN_PIN 27
-
-// --- Encoder ---
-#define ENCODER_PIN_A 32
-#define ENCODER_PIN_B 33
+#define STEPPER_MAX_SPEED 1000.0   // steps/sec
+#define STEPPER_ACCELERATION 500.0 // steps/sec^2
 
 // --- Solenoid Relay ---
 #define SOLENOID_RELAY_PIN 14
