@@ -9,14 +9,14 @@ void BatteryMonitor::begin() {
 }
 
 float BatteryMonitor::getVoltage() {
-    // Read raw ADC value (12-bit on ESP32, 0-4095)
+    // Read raw ADC value (10-bit on ESP8266, 0-1023)
     int raw = analogRead(VBAT_PIN);
     
-    // Convert to voltage (ESP32 ADC reference is roughly 3.3V)
-    // Needs calibration for accurate reading
-    float pinVoltage = (raw / 4095.0) * 3.3;
+    // Convert to voltage (ESP8266 ADC reference is usually 1.0V or scaled to 3.3V on dev boards)
+    // Assuming a dev board like NodeMCU/D1 Mini with built-in voltage divider for 3.3V
+    float pinVoltage = (raw / 1023.0) * 3.3;
     
-    // Calculate actual battery voltage using the divider ratio
+    // Calculate actual battery voltage using the external divider ratio
     float vBat = pinVoltage * VBAT_DIVIDER_RATIO;
     
     return vBat;

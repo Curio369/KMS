@@ -1,9 +1,12 @@
 #include <Arduino.h>
+#include <SoftwareSerial.h>
 #include "Config.h"
 #include "Protocol.h"
 #include "StepperController.h"
 #include "SolenoidController.h"
 #include "BatteryMonitor.h"
+
+SoftwareSerial commSerial(COMM_RX_PIN, COMM_TX_PIN);
 
 StepperController stepper;
 SolenoidController solenoid;
@@ -28,51 +31,51 @@ void processCommand(String cmd) {
         long target = param.toInt();
         stepper.moveTo(target);
         currentState = STATE_MOVING;
-        Serial1.println("ACK:GOTO");
+        commSerial.println("ACK:GOTO");
         Serial.print("Moving to: "); Serial.println(target);
     } 
     else if (command == "ACTUATE") {
         bool engage = (param.toInt() == 1);
         solenoid.actuate(engage);
-        Serial1.println("ACK:ACTUATE");
+        commSerial.println("ACK:ACTUATE");
         Serial.print("Solenoid Actuated: "); Serial.println(engage);
     }
     else if (command == "BATT") {
         int percent = battery.getPercentage();
-        Serial1.print("BATT:");
-        Serial1.println(percent);
+        commSerial.print("BATT:");
+        commSerial.println(percent);
     }
     else if (command == "STATUS") {
-        Serial1.print("STATUS:");
-        if (currentState == STATE_IDLE) Serial1.println("IDLE");
-        else if (currentState == STATE_MOVING) Serial1.println("MOVING");
-        else Serial1.println("ERROR");
+        commSerial.print("STATUS:");
+        if (currentState == STATE_IDLE) commSerial.println("IDLE");
+        else if (currentState == STATE_MOVING) commSerial.println("MOVING");
+        else commSerial.println("ERROR");
     }
     else {
-        Serial1.print("ERR:UNKNOWN_CMD_");
-        Serial1.println(command);
+        commSerial.print("ERR:UNKNOWN_CMD_");
+        commSerial.println(command);
     }
 }
 
 void setup() {
-    // Initialize debug serial (USB CDC on ESP32-S3)
+    // Initialize debug serial
     Serial.begin(115200);
     
-    // Initialize communication with High-Level ESP32
-    Serial1.begin(COMM_BAUD_RATE, SERIAL_8N1, COMM_RX_PIN, COMM_TX_PIN);
+    // Initialize communication with High-Level ESP
+    commSerial.begin(COMM_BAUD_RATE);
     
     // Initialize hardware controllers
     stepper.begin();
     solenoid.begin();
     battery.begin();
     
-    Serial.println("Low-Level ESP32-S3 KMS Controller Initialized.");
+    Serial.println("Low-Level ESP8266 KMS Controller Initialized.");
 }
 
 void loop() {
     // 1. Process incoming commands from High-Level ESP32
-    if (Serial1.available()) {
-        String incomingCmd = Serial1.readStringUntil('\n');
+    if (commSerial.available()) {
+        String incomingCmd = commSerial.readStringUntil('\n');
         processCommand(incomingCmd);
     }
     
@@ -84,7 +87,7 @@ void loop() {
     if (currentState == STATE_MOVING && !stepper.isMoving()) {
         // Just finished moving
         currentState = STATE_IDLE;
-        Serial1.println("DONE:GOTO");
+        commSerial.println("DONE:GOTO");
         Serial.print("Reached target position: ");
         Serial.println(stepper.getPosition());
     }
