@@ -23,7 +23,7 @@
 // UART for transmitting to electronics ESP
 #define UART_TX_PIN 17
 #define UART_RX_PIN 16
-#define UART_BAUD 115200
+#define UART_BAUD 9600
 
 // Security: 32-byte shared key (use unique per-device!)
 const uint8_t SHARED_KEY[32] = {
@@ -119,7 +119,7 @@ bool checkSession(AsyncWebServerRequest *request) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   // UART1 for transmit to electronics ESP
   Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
