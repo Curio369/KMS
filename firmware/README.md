@@ -153,8 +153,9 @@ dispense path is dead even over the local AP.
 ### Test it in layers
 
 ```bash
-# 1. protocol parser, on the host — no hardware
+# 1. pure-C headers, on the host — no hardware
 cc -o /tmp/tp firmware/tools/test_protocol.c && /tmp/tp
+cc -o /tmp/tn firmware/tools/test_nonce.c    && /tmp/tn
 
 # 2. Uno alone, over USB with DEBUG_VIA_USB temporarily true
 #    send ANGLE:90 -> expect ACK: then DONE:
@@ -163,12 +164,19 @@ cc -o /tmp/tp firmware/tools/test_protocol.c && /tmp/tp
 mosquitto_sub -h <host> -p 8883 --capath /etc/ssl/certs \
               -u <user> -P <pass> -t 'device/#' -v
 
-# 4. command path, without the website
+# 4. command path, without the website. The nonce is a STRING — the backend
+#    mints it with secrets.token_hex(16), and a bare number here would not
+#    exercise the path the website actually uses.
 mosquitto_pub -h <host> -p 8883 --capath /etc/ssl/certs \
               -u <user> -P <pass> \
               -t 'device/<uuid>/rack/command' \
-              -m '{"action":"dispense","slot_number":3,"nonce":12345}'
+              -m '{"action":"dispense","slot_number":3,"nonce":"a3f9c2d1e4b5a6978877665544332211"}'
 ```
+
+Expect `[mqtt] dispense slot 3` on serial. `[mqtt] no nonce, dropped` means the
+payload carried no nonce the firmware could parse; `[mqtt] replay <nonce>` means
+that exact nonce is already in the 64-entry ring — mint a new one.
+`"action":"unlock"` (a key *return*) drives the same platter move.
 
 Then the full path with the phone on mobile data for everything except the code
 read.

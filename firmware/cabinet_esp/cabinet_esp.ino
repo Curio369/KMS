@@ -60,6 +60,7 @@
 #include "protocol.h"
 #include "urlencode.h"
 #include "portal_scrape.h"
+#include "nonce.h"
 
 DNSServer dnsServer;
 AsyncWebServer server(HTTP_PORT);
@@ -113,7 +114,10 @@ enum DispState { DISP_IDLE, DISP_MOVING, DISP_HOLD };
 static DispState dispState   = DISP_IDLE;
 static uint32_t  dispSince   = 0;
 static int       dispSlot    = 0;
-static uint32_t  dispNonce   = 0;
+// The nonce verbatim, not its fingerprint: mqtt_listener.py stores the whole
+// rack/event payload as the audit log's metadata, and correlating a command to
+// its outcome means matching this against the nonce key_service.py logged.
+static char      dispNonce[NONCE_STR_MAX] = "";
 // Set by handleReply() when the Uno reports a completed move, consumed by
 // dispenseTick(). A flag rather than a direct call keeps the sequencer below
 // the reply handler in the file and avoids a forward declaration.
@@ -424,19 +428,20 @@ static void rememberNonce(uint32_t nonce) {
 }
 
 // Key is "event", not "status" — mqtt_listener.py reads data.get("event") and
-// logs it as slot_<event>.
-static void publishRackEvent(const char *event, int slot, uint32_t nonce) {
+// logs it as slot_<event>. The nonce goes back as the string it arrived as, so
+// the audit log can be joined against the command that caused it.
+static void publishRackEvent(const char *event, int slot, const char *nonce) {
   if (!mqtt.connected()) return;
   char payload[128];
   snprintf(payload, sizeof payload,
-           "{\"event\":\"%s\",\"slot_number\":%d,\"nonce\":%lu}",
-           event, slot, (unsigned long)nonce);
+           "{\"event\":\"%s\",\"slot_number\":%d,\"nonce\":\"%s\"}",
+           event, slot, nonce);
   mqtt.publish(TOPIC_RACK_EVT, payload);
 }
 
 // ── Dispense sequencer ───────────────────────────────────────────────────────
 
-static bool startDispense(int slot, uint32_t nonce) {
+static bool startDispense(int slot, const char *nonce) {
   if (dispState != DISP_IDLE) return false;          // one at a time
   if (slot < 1 || slot > SLOT_COUNT) return false;
 
@@ -445,7 +450,7 @@ static bool startDispense(int slot, uint32_t nonce) {
   if (!queueLine("ANGLE", angle)) return false;
 
   dispSlot = slot;
-  dispNonce = nonce;
+  snprintf(dispNonce, sizeof dispNonce, "%s", nonce);
   dispDoneSeen = false;
   dispSince = millis();
   dispState = DISP_MOVING;
@@ -489,21 +494,36 @@ static void onMessage(char *topic, byte *payload, unsigned int len) {
   JsonDocument doc;
   if (deserializeJson(doc, payload, len)) { Serial.println("[mqtt] bad JSON"); return; }
 
-  const uint32_t nonce = doc["nonce"] | 0UL;
+  // The backend sends a 32-hex-char string (secrets.token_hex(16)), not a
+  // number. Reading it straight into a uint32_t yielded 0 and dropped every
+  // command the website issued — hence nonce_fold(), which keeps the ring
+  // 32-bit while accepting the real wire format.
+  const char *nonceStr = doc["nonce"].as<const char *>();
+  char nonceBuf[NONCE_STR_MAX];
+  if (!nonceStr) {                                   // bare number, hand-sent
+    snprintf(nonceBuf, sizeof nonceBuf, "%lu", (unsigned long)(doc["nonce"] | 0UL));
+    nonceStr = nonceBuf;
+  }
+  const uint32_t nonce = nonce_fold(nonceStr);
   if (!nonce)            { Serial.println("[mqtt] no nonce, dropped"); return; }
-  if (nonceSeen(nonce))  { Serial.printf("[mqtt] replay %lu\n", (unsigned long)nonce); return; }
+  if (nonceSeen(nonce))  { Serial.printf("[mqtt] replay %s\n", nonceStr); return; }
   rememberNonce(nonce);
 
+  // "unlock" is a key *return*: mqtt_service.py publishes it on the same topic
+  // and it needs the exact same platter move, so it shares the sequencer.
   const char *action = doc["action"] | "";
-  if (strcmp(action, "dispense")) { Serial.printf("[mqtt] unknown action %s\n", action); return; }
-
-  const int slot = doc["slot_number"] | doc["slot_id"] | 0;
-  if (!startDispense(slot, nonce)) {
-    publishRackEvent("failed", slot, nonce);
-    Serial.printf("[mqtt] dispense slot %d rejected (busy or out of range)\n", slot);
+  if (strcmp(action, "dispense") && strcmp(action, "unlock")) {
+    Serial.printf("[mqtt] unknown action %s\n", action);
     return;
   }
-  Serial.printf("[mqtt] dispensing slot %d\n", slot);
+
+  const int slot = doc["slot_number"] | doc["slot_id"] | 0;
+  if (!startDispense(slot, nonceStr)) {
+    publishRackEvent("failed", slot, nonceStr);
+    Serial.printf("[mqtt] %s slot %d rejected (busy or out of range)\n", action, slot);
+    return;
+  }
+  Serial.printf("[mqtt] %s slot %d\n", action, slot);
   (void)topic;
 }
 
