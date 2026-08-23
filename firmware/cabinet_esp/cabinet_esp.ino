@@ -1,8 +1,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // KMS high-level (cabinet) ESP32
 //
-// SoftAP + captive portal + LittleFS web UI, unchanged from the original
-// sketch. What changed is everything behind /api:
+// Three jobs:
+//
+//   1. SoftAP + captive portal + LittleFS web UI. The portal shows the current
+//      proximity code and then hands the phone off to the deployed website. The
+//      AP has NO internet route on purpose.
+//   2. MQTT uplink over the station interface. This is what stops the phone
+//      being the transport: the backend publishes dispense commands to the
+//      broker and the cabinet picks them up on its own internet connection, so
+//      the phone only ever needs internet and never needs to be on the ESP AP.
+//      On a campus network that hijacks traffic until its login form is POSTed,
+//      the portal login runs first — see the captive portal section.
+//   3. UART bridge to the Arduino Uno that drives the stepper and solenoid.
+//
+// Nothing in the MQTT path blocks. dnsServer.processNextRequest() and the UART
+// poll have to keep running while the broker is unreachable, so the dispense
+// sequence is a state machine and reconnects use a backoff timer.
+//
+// What changed from the original sketch is everything behind /api:
 //
 //   - /api/action now speaks the plaintext protocol.h line format accepted by
 //     the Arduino Uno low-level controller.
@@ -10,19 +26,22 @@
 //     used request->getParam("plain", true), which only exists for
 //     application/x-www-form-urlencoded, so a real application/json POST fell
 //     through to the 400/401 branch every time.
-//   - Login compares the whole password field, in constant time, instead of
-//     testing whether the raw body *contained* the password anywhere.
-//   - UART writes happen only in loop(). Handlers run in the AsyncTCP task;
+//   - The local page creates a short-lived session automatically after the
+//     phone joins the password-protected ESP access point.
+//   - UART writes happen only in loop(). Handlers run in the AsyncTCP task,
 //     touching Serial1 from there races the poll loop, so they hand lines to
-//     a FreeRTOS queue instead.
+//     a FreeRTOS queue instead. The MQTT callback runs from mqtt.loop(), which
+//     loop() calls, so it shares loop()'s context and needs no lock.
 //
 // Libraries (Arduino IDE -> Library Manager):
 //   - ESPAsyncWebServer + AsyncTCP
 //   - ArduinoJson (pulled in by AsyncJson.h)
+//   - PubSubClient (Nick O'Leary)
 //   mbedTLS and LittleFS ship with the ESP32 core.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <AsyncTCP.h>
 // Must precede ESPAsyncWebServer.h: that header gates its JSON support on
 // __has_include("ArduinoJson.h"), and the Arduino builder only puts ArduinoJson
@@ -32,13 +51,27 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncJson.h>
 #include <DNSServer.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include <time.h>
 #include "LittleFS.h"
 
 #include "config.h"
 #include "protocol.h"
+#include "urlencode.h"
+#include "portal_scrape.h"
 
 DNSServer dnsServer;
 AsyncWebServer server(HTTP_PORT);
+
+#if MQTT_TLS
+WiFiClientSecure net;
+#else
+WiFiClient net;
+#endif
+PubSubClient mqtt(net);
+
+static const int SLOT_ANGLE[SLOT_COUNT] = SLOT_ANGLES;
 
 // Lines waiting to go out on the UART. Written by the AsyncTCP task, read by
 // loop(), which is the only context that touches Serial1.
@@ -57,8 +90,34 @@ static uint32_t uartRejected = 0;
 // needs no lock — only loop() runs elsewhere and loop() never reads it.
 static String   sessionToken = "";
 static uint32_t sessionExpiry = 0;
-static uint8_t  loginFails = 0;
-static uint32_t lockedUntil = 0;
+static uint32_t lastStaAttempt = 0;
+
+// Current proximity code. Rotated by loop(), read by the AsyncTCP task through
+// /api/proximity-code, so it needs its own critical section. Kept separate from
+// snapMux to keep each section as short as possible.
+static portMUX_TYPE codeMux = portMUX_INITIALIZER_UNLOCKED;
+static char     proximityCode[CODE_LENGTH + 1] = "";
+static uint32_t lastCodeRotate = 0;
+
+// Replay protection. The backend stamps every command with a nonce; a repeat
+// means either a retry we already served or an attacker replaying a captured
+// publish, and both should be ignored.
+static uint32_t nonceRing[NONCE_CACHE];
+static uint8_t  nonceHead = 0;
+
+// Dispense sequencer. The Uno's protocol is one line at a time with a DONE
+// coming back later, so a dispense is three UART lines spread over seconds.
+// Blocking here would starve the DNS server and mqtt.loop(), so it is a state
+// machine ticked from loop().
+enum DispState { DISP_IDLE, DISP_MOVING, DISP_HOLD };
+static DispState dispState   = DISP_IDLE;
+static uint32_t  dispSince   = 0;
+static int       dispSlot    = 0;
+static uint32_t  dispNonce   = 0;
+// Set by handleReply() when the Uno reports a completed move, consumed by
+// dispenseTick(). A flag rather than a direct call keeps the sequencer below
+// the reply handler in the file and avoids a forward declaration.
+static bool      dispDoneSeen = false;
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -97,13 +156,6 @@ static bool checkSession(AsyncWebServerRequest *request) {
   if (given.length() != sessionToken.length()) return false;
   return ctEqual((const uint8_t *)given.c_str(),
                      (const uint8_t *)sessionToken.c_str(), given.length());
-}
-
-static bool passwordOk(const char *given) {
-  const size_t n = strlen(ADMIN_PASSWORD);
-  if (!given || strlen(given) != n) return false;
-  return ctEqual((const uint8_t *)given,
-                     (const uint8_t *)ADMIN_PASSWORD, n);
 }
 
 // ── Outbound protocol lines ──────────────────────────────────────────────────
@@ -170,10 +222,345 @@ static void handleReply(const char *line) {
     case PCMD_DONE:
     case PCMD_ERR:
       noteEvent(line);
+      // ponytail: any DONE advances the sequencer. A manual /api/action move
+      // running concurrently with a dispense could satisfy the wrong wait; the
+      // DISPENSE_TIMEOUT_MS ceiling means the worst case is one early solenoid
+      // pulse, not a stuck rack. Tag commands with an id if that ever matters.
+      if (c.verb == PCMD_DONE) dispDoneSeen = true;
       return;
     default:
       return;
   }
+}
+
+// ── Campus captive portal ────────────────────────────────────────────────────
+// The uplink network associates freely and then intercepts everything until its
+// login form is POSTed, so association is not the same thing as connectivity.
+//
+// This runs only while MQTT is down. A live MQTT session is itself proof the
+// portal session is open, and its keepalives are what hold the session open, so
+// in steady state this costs nothing and never blocks loop().
+
+#if PORTAL_LOGIN
+
+static bool portalOk = false;
+
+// True only for a bare 204. A 200 with a body, a redirect to the portal, or a
+// timeout all mean traffic is being rewritten.
+static bool portalProbe() {
+  HTTPClient http;
+  http.setConnectTimeout(PORTAL_TIMEOUT_MS);
+  http.setTimeout(PORTAL_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  if (!http.begin(PORTAL_PROBE_URL)) return false;
+  const int rc = http.GET();
+  http.end();
+  return rc == 204;
+}
+
+// FortiGate hands out a per-session `magic` token in the login form, so this is
+// a two-step exchange: GET the form, scrape the magic, POST it back with the
+// credential. A stale or missing magic is rejected exactly as a wrong password
+// would be, which is why the scrape has its own host test.
+static bool portalLogin() {
+  // Pinned trust anchor, not setInsecure(): this request carries the campus
+  // credential, and an unverified socket would hand it to anyone who can answer
+  // on the portal's port.
+  WiFiClientSecure tls;
+  tls.setCACert(PORTAL_ROOT_CA);
+  tls.setTimeout(PORTAL_TIMEOUT_MS / 1000);
+
+  char magic[PORTAL_MAGIC_MAX];
+  {
+    HTTPClient http;
+    http.setConnectTimeout(PORTAL_TIMEOUT_MS);
+    http.setTimeout(PORTAL_TIMEOUT_MS);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    if (!http.begin(tls, PORTAL_FORM_URL)) return false;
+    const int rc = http.GET();
+    if (rc != 200) {
+      Serial.printf("[portal] form GET -> %d\n", rc);
+      http.end();
+      return false;
+    }
+    if (http.getSize() > PORTAL_FORM_MAX) {
+      Serial.printf("[portal] form too large (%d B), refusing\n", http.getSize());
+      http.end();
+      return false;
+    }
+    const String form = http.getString();
+    http.end();
+    if (!scrape_attr(form.c_str(), PORTAL_MAGIC_TAG, magic, sizeof magic)) {
+      // Either the portal changed its markup or we are already logged in and it
+      // served the "Authentication Successful" page, which carries no magic.
+      Serial.println("[portal] no magic in form");
+      return false;
+    }
+  }
+
+  char redir[128], user[128], pass[128];
+  url_encode(PORTAL_REDIR, redir, sizeof redir);
+  url_encode(PORTAL_USERNAME, user, sizeof user);
+  url_encode(PORTAL_PASSWORD, pass, sizeof pass);
+  // magic is 16 hex chars from the portal's own markup, but encode it anyway
+  // rather than trusting remote bytes to be safe in a form body.
+  char magicEnc[PORTAL_MAGIC_MAX * 3];
+  url_encode(magic, magicEnc, sizeof magicEnc);
+
+  char body[512];
+  const int n = snprintf(body, sizeof body, PORTAL_LOGIN_BODY,
+                         redir, magicEnc, user, pass);
+  if (n < 0 || (size_t)n >= sizeof body) {
+    // Truncated body would POST a cut-off password and read as bad credentials.
+    Serial.println("[portal] login body truncated, refusing");
+    return false;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(PORTAL_TIMEOUT_MS);
+  http.setTimeout(PORTAL_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  if (!http.begin(tls, PORTAL_LOGIN_URL)) return false;
+  http.addHeader("Content-Type", PORTAL_CONTENT_TYPE);
+  const int rc = http.POST((uint8_t *)body, (size_t)n);
+  const String reply = (rc == 200) ? http.getString() : String();
+  http.end();
+  memset(body, 0, sizeof body);          // don't leave the password on the stack
+
+  // The request body is deliberately never logged: it holds the credential, and
+  // the serial console is not a private channel. FortiGate answers 200 for a
+  // rejected login too, so rc is not the verdict — the probe in portalService()
+  // is. This only separates "wrong password" from "something else broke", which
+  // is the difference between two very different debugging afternoons.
+  const bool rejected = reply.indexOf(PORTAL_REJECT_MARKER) >= 0;
+  Serial.printf("[portal] login POST -> %d%s\n", rc,
+                rejected ? " (credential rejected)" : "");
+  return rc > 0 && rc < 400 && !rejected;
+}
+
+// ponytail: the HTTP calls block loop() for up to PORTAL_TIMEOUT_MS, which
+// stalls dnsServer.processNextRequest() for that long. Only happens while the
+// broker is unreachable, and the AsyncTCP web server runs in its own task, so
+// the portal page keeps serving. Move to a task if the DNS stall ever shows.
+static void portalService() {
+  static uint32_t nextTry = 0;
+  static bool tried = false;
+
+  if (WiFi.status() != WL_CONNECTED) { portalOk = false; tried = false; return; }
+  if (mqtt.connected()) { portalOk = true; return; }
+  if (tried && (int32_t)(millis() - nextTry) < 0) return;
+  tried = true;
+
+  portalOk = portalProbe();
+  if (!portalOk) {
+    Serial.println("[portal] traffic intercepted, logging in");
+    if (portalLogin()) portalOk = portalProbe();
+    Serial.printf("[portal] %s\n", portalOk ? "session open" : "still blocked");
+  }
+  nextTry = millis() + (portalOk ? PORTAL_RECHECK_MS : PORTAL_RETRY_MS);
+}
+
+#else
+static const bool portalOk = true;      // nothing to log into
+static inline void portalService() {}
+#endif
+
+// ── MQTT ─────────────────────────────────────────────────────────────────────
+// Everything here runs from loop() (mqtt.loop() dispatches the callback in the
+// caller's context), so it shares the UART reader's context and needs no lock
+// except where it touches proximityCode, which the web handler also reads.
+
+// TLS certificates carry notBefore/notAfter. The ESP32's clock starts at the
+// epoch, so a handshake before the first NTP sync fails validation and surfaces
+// only as PubSubClient rc=-2 — hours of "the broker is broken" for a clock bug.
+// Lazy and non-blocking because STA association happens in loop(), not setup():
+// a blocking sync in setup() would always time out.
+static bool timeSynced() {
+  static bool requested = false;
+  if (!requested) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    requested = true;
+  }
+  return time(nullptr) >= 1700000000;   // 2023-11-14, comfortably past any cert
+}
+
+static void generateCode() {
+  static const char *alphabet = CODE_ALPHABET;
+  const size_t n = strlen(alphabet);
+  portENTER_CRITICAL(&codeMux);
+  for (size_t i = 0; i < CODE_LENGTH; i++) proximityCode[i] = alphabet[esp_random() % n];
+  proximityCode[CODE_LENGTH] = '\0';
+  portEXIT_CRITICAL(&codeMux);
+  lastCodeRotate = millis();
+}
+
+static void copyCode(char *out) {
+  portENTER_CRITICAL(&codeMux);
+  memcpy(out, proximityCode, CODE_LENGTH + 1);
+  portEXIT_CRITICAL(&codeMux);
+}
+
+// Retained: Render's free tier spins the backend down, and a restart drops the
+// Redis cache. Retained means the broker replays the current code on subscribe
+// instead of leaving every member locked out until the next rotation.
+static void publishCode() {
+  if (!mqtt.connected()) return;
+  char code[CODE_LENGTH + 1];
+  copyCode(code);
+  char payload[64];
+  snprintf(payload, sizeof payload, "{\"code\":\"%s\"}", code);
+  mqtt.publish(TOPIC_CODE, payload, true);
+  Serial.printf("[code] %s -> %s\n", code, TOPIC_CODE);
+}
+
+static bool nonceSeen(uint32_t nonce) {
+  for (uint8_t i = 0; i < NONCE_CACHE; i++) if (nonceRing[i] == nonce) return true;
+  return false;
+}
+
+static void rememberNonce(uint32_t nonce) {
+  nonceRing[nonceHead] = nonce;
+  nonceHead = (nonceHead + 1) % NONCE_CACHE;
+}
+
+// Key is "event", not "status" — mqtt_listener.py reads data.get("event") and
+// logs it as slot_<event>.
+static void publishRackEvent(const char *event, int slot, uint32_t nonce) {
+  if (!mqtt.connected()) return;
+  char payload[128];
+  snprintf(payload, sizeof payload,
+           "{\"event\":\"%s\",\"slot_number\":%d,\"nonce\":%lu}",
+           event, slot, (unsigned long)nonce);
+  mqtt.publish(TOPIC_RACK_EVT, payload);
+}
+
+// ── Dispense sequencer ───────────────────────────────────────────────────────
+
+static bool startDispense(int slot, uint32_t nonce) {
+  if (dispState != DISP_IDLE) return false;          // one at a time
+  if (slot < 1 || slot > SLOT_COUNT) return false;
+
+  char angle[16];
+  snprintf(angle, sizeof angle, "%d", SLOT_ANGLE[slot - 1] + SLOT_ANGLE_OFFSET);
+  if (!queueLine("ANGLE", angle)) return false;
+
+  dispSlot = slot;
+  dispNonce = nonce;
+  dispDoneSeen = false;
+  dispSince = millis();
+  dispState = DISP_MOVING;
+  return true;
+}
+
+static void dispenseTick() {
+  if (dispState == DISP_IDLE) return;
+
+  const uint32_t age = millis() - dispSince;
+
+  if (dispState == DISP_MOVING) {
+    if (dispDoneSeen) {
+      dispDoneSeen = false;
+      queueLine("ACTUATE", "1");
+      dispSince = millis();
+      dispState = DISP_HOLD;
+      return;
+    }
+    if (age >= DISPENSE_TIMEOUT_MS) {
+      publishRackEvent("failed", dispSlot, dispNonce);
+      Serial.printf("[rack] slot %d timed out waiting for DONE\n", dispSlot);
+      dispState = DISP_IDLE;
+    }
+    return;
+  }
+
+  // DISP_HOLD: release and report in the same step. The Uno drops the solenoid
+  // on its own 5 s safety timeout, so a lost ACTUATE:0 is not a stuck latch.
+  if (age >= DISPENSE_HOLD_MS) {
+    queueLine("ACTUATE", "0");
+    publishRackEvent("dispensed", dispSlot, dispNonce);
+    Serial.printf("[rack] slot %d dispensed\n", dispSlot);
+    dispState = DISP_IDLE;
+  }
+}
+
+// ── Command intake ───────────────────────────────────────────────────────────
+
+static void onMessage(char *topic, byte *payload, unsigned int len) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, len)) { Serial.println("[mqtt] bad JSON"); return; }
+
+  const uint32_t nonce = doc["nonce"] | 0UL;
+  if (!nonce)            { Serial.println("[mqtt] no nonce, dropped"); return; }
+  if (nonceSeen(nonce))  { Serial.printf("[mqtt] replay %lu\n", (unsigned long)nonce); return; }
+  rememberNonce(nonce);
+
+  const char *action = doc["action"] | "";
+  if (strcmp(action, "dispense")) { Serial.printf("[mqtt] unknown action %s\n", action); return; }
+
+  const int slot = doc["slot_number"] | doc["slot_id"] | 0;
+  if (!startDispense(slot, nonce)) {
+    publishRackEvent("failed", slot, nonce);
+    Serial.printf("[mqtt] dispense slot %d rejected (busy or out of range)\n", slot);
+    return;
+  }
+  Serial.printf("[mqtt] dispensing slot %d\n", slot);
+  (void)topic;
+}
+
+// ── Connection / telemetry ───────────────────────────────────────────────────
+
+static void sendHeartbeat() {
+  if (!mqtt.connected()) return;
+
+  char payload[96];
+  snprintf(payload, sizeof payload, "{\"firmware_version\":\"%s\"}", FIRMWARE_VERSION);
+  mqtt.publish(TOPIC_HEARTBEAT, payload);
+
+  int batt;
+  portENTER_CRITICAL(&snapMux);
+  batt = snapBatt;
+  portEXIT_CRITICAL(&snapMux);
+
+  // Only report a battery number the Uno actually gave us. kms_enclosure
+  // hardcodes 100, which is worse than absent: it looks like a healthy reading.
+  if (batt >= 0)
+    snprintf(payload, sizeof payload, "{\"battery_pct\":%d,\"rssi\":%d}", batt, WiFi.RSSI());
+  else
+    snprintf(payload, sizeof payload, "{\"rssi\":%d}", WiFi.RSSI());
+  mqtt.publish(TOPIC_TELEM, payload);
+}
+
+// Non-blocking: called every loop(), returns immediately unless the backoff has
+// elapsed. mqtt.connect() itself blocks for the TLS handshake, which is why the
+// backoff caps at MQTT_RETRY_MAX_MS instead of retrying every pass.
+static void mqttService() {
+  static uint32_t nextAttempt = 0;
+  static uint32_t backoff = MQTT_RETRY_MIN_MS;
+
+  if (mqtt.connected()) { mqtt.loop(); return; }
+  if (WiFi.status() != WL_CONNECTED) return;
+  // Before timeSynced(), not after. SNTP fires its first request the moment
+  // configTime() is called and then waits CONFIG_LWIP_SNTP_UPDATE_DELAY — 3 hours
+  // on this core — before trying again. A request sent into a portal-blocked
+  // network is silently dropped, so the clock would not be set for three hours
+  // and every TLS handshake until then fails with rc=-2.
+  if (!portalOk) return;
+  if (nextAttempt && (int32_t)(millis() - nextAttempt) < 0) return;
+  if (!timeSynced()) { nextAttempt = millis() + MQTT_RETRY_MIN_MS; return; }
+
+  const String clientId = String("kms-") + DEVICE_UUID;
+  if (mqtt.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
+    Serial.println("[mqtt] connected");
+    mqtt.subscribe(TOPIC_RACK_CMD, 1);
+    publishCode();        // re-seed the backend after any reconnect
+    sendHeartbeat();
+    backoff = MQTT_RETRY_MIN_MS;
+  } else {
+    Serial.printf("[mqtt] connect failed rc=%d, retry in %lums\n",
+                  mqtt.state(), (unsigned long)backoff);
+    backoff = backoff * 2 > MQTT_RETRY_MAX_MS ? MQTT_RETRY_MAX_MS : backoff * 2;
+  }
+  nextAttempt = millis() + backoff;
 }
 
 // ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -184,27 +571,14 @@ static void sendErr(AsyncWebServerRequest *r, int code, const char *msg) {
   r->send(code, "application/json", body);
 }
 
-static void onLogin(AsyncWebServerRequest *request, JsonVariant &json) {
-  if ((int32_t)(millis() - lockedUntil) < 0) {
-    sendErr(request, 429, "locked");
-    return;
-  }
-  // Field-scoped compare. The original tested body.indexOf(expectedPass), so
-  // {"password":"wrong","note":"kmsadminpw"} authenticated — as did any body
-  // that mentioned the password for any reason.
-  if (!json.is<JsonObject>() || !passwordOk(json["password"].as<const char *>())) {
-    // Rate limit: the AP is reachable by anyone in radio range and the
-    // password is a single fixed string, so an unthrottled endpoint is a
-    // few minutes of guessing.
-    if (++loginFails >= 5) {
-      loginFails = 0;
-      lockedUntil = millis() + 30000UL;
-    }
-    sendErr(request, 401, "invalid");
-    return;
-  }
+static void onPortalConfig(AsyncWebServerRequest *request) {
+  char body[192];
+  snprintf(body, sizeof body, "{\"website_url\":\"%s\"}", KMS_WEBSITE_URL);
+  request->send(200, "application/json", body);
+}
 
-  loginFails = 0;
+static void onLogin(AsyncWebServerRequest *request, JsonVariant &json) {
+  (void)json;
   sessionToken = genToken();
   sessionExpiry = millis() + SESSION_TTL_MS;
 
@@ -295,6 +669,30 @@ static void onStatus(AsyncWebServerRequest *request) {
   request->send(200, "application/json", body);
 }
 
+// Session-gated so a captive-portal probe or a passing network scanner cannot
+// harvest a live code without first POSTing /api/login. The real gate is WPA2
+// membership of the AP — this just keeps drive-by GETs out.
+static void onProximityCode(AsyncWebServerRequest *request) {
+  if (!checkSession(request)) { sendErr(request, 403, "auth"); return; }
+
+  char code[CODE_LENGTH + 1];
+  copyCode(code);
+
+  char body[96];
+  snprintf(body, sizeof body, "{\"code\":\"%s\",\"rotates_in_ms\":%lu}", code,
+           (unsigned long)(CODE_ROTATE_MS - (millis() - lastCodeRotate)));
+  request->send(200, "application/json", body);
+}
+
+static void sendPortal(AsyncWebServerRequest *request) {
+  AsyncWebServerResponse *response =
+      request->beginResponse(LittleFS, "/index.html", "text/html");
+  response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  response->addHeader("Pragma", "no-cache");
+  response->addHeader("Expires", "0");
+  request->send(response);
+}
+
 // ── Setup / loop ─────────────────────────────────────────────────────────────
 
 void setup() {
@@ -308,10 +706,21 @@ void setup() {
 
   String chip = String((uint32_t)ESP.getEfuseMac(), HEX);
   String apSsid = String(AP_SSID_PREFIX) + chip.substring(chip.length() - 6);
-  WiFi.mode(WIFI_AP);
+  // AP is brought up first so the phone can connect even when upstream Wi-Fi
+  // is unavailable. STA is maintained independently and never blocks the
+  // local portal.
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSsid.c_str(), AP_PASSWORD);
   IPAddress apIP = WiFi.softAPIP();
   Serial.printf("Started AP %s, IP: %s\n", apSsid.c_str(), apIP.toString().c_str());
+
+#if KMS_STA_CONFIGURED
+  WiFi.begin(STA_SSID, STA_PASSWORD);
+  lastStaAttempt = millis();
+  Serial.printf("Starting upstream Wi-Fi: %s\n", STA_SSID);
+#else
+  Serial.println("Upstream Wi-Fi is not configured; AP remains local-only.");
+#endif
 
   dnsServer.start(DNS_PORT, "*", apIP);
 
@@ -333,16 +742,46 @@ void setup() {
   server.addHandler(actionH);
 
   server.on("/api/status", HTTP_GET, onStatus);
+  server.on("/api/portal-config", HTTP_GET, onPortalConfig);
+  server.on("/api/proximity-code", HTTP_GET, onProximityCode);
+
+  // Common captive-portal connectivity checks. Returning the local page for
+  // these HTTP probes prompts supported phones to open their sign-in browser.
+  server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/index.html", "text/html");
+  });
+  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/index.html", "text/html");
+  });
+  server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/index.html", "text/html");
+  });
+
+  server.on("/portal", HTTP_GET, sendPortal);
 
   server.onNotFound([](AsyncWebServerRequest *request) {
-    AsyncWebServerResponse *response =
-        request->beginResponse(LittleFS, "/index.html", "text/html");
-    response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    request->send(response);
+    if (request->url().startsWith("/api/")) {
+      request->send(404, "application/json", "{\"error\":\"not_found\"}");
+      return;
+    }
+    sendPortal(request);
   });
 
   server.begin();
   Serial.println("Web server started");
+
+  // MQTT is configured here but never connected here: STA association happens
+  // in loop(), so setup() has no network yet. mqttService() does the connecting.
+#if MQTT_TLS
+  net.setCACert(MQTT_ROOT_CA);
+#endif
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(onMessage);
+  // Default 256 B truncates a TLS-framed publish silently — no error, no packet.
+  mqtt.setBufferSize(MQTT_TLS ? 1024 : 512);
+
+  generateCode();
+  Serial.printf("[code] initial %s\n", proximityCode);
 }
 
 void loop() {
@@ -352,6 +791,26 @@ void loop() {
   static bool rxOverflow = false;
 
   dnsServer.processNextRequest();
+
+#if KMS_STA_CONFIGURED
+  static bool reportedConnected = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!reportedConnected) {
+      Serial.printf("Upstream Wi-Fi connected: %s, RSSI %d dBm\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      reportedConnected = true;
+    }
+  } else {
+    if (reportedConnected) {
+      Serial.println("Upstream Wi-Fi disconnected; retrying.");
+      reportedConnected = false;
+    }
+    if (millis() - lastStaAttempt >= STA_RETRY_INTERVAL_MS) {
+      lastStaAttempt = millis();
+      WiFi.begin(STA_SSID, STA_PASSWORD);
+    }
+  }
+#endif
 
   // Only context that writes the UART.
   while (xQueueReceive(txQueue, line, 0) == pdTRUE) {
@@ -382,5 +841,20 @@ void loop() {
     lastPoll = millis();
     queueLine("STATUS", "?");
     queueLine("BATT", "?");
+  }
+
+  portalService();
+  mqttService();
+  dispenseTick();
+
+  if (millis() - lastCodeRotate >= CODE_ROTATE_MS) {
+    generateCode();
+    publishCode();
+  }
+
+  static uint32_t lastBeat = 0;
+  if (millis() - lastBeat >= HEARTBEAT_MS) {
+    lastBeat = millis();
+    sendHeartbeat();
   }
 }
