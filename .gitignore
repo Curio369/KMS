@@ -50,3 +50,6 @@ backend/scripts/
 backend/tests/
 .pio/
 .vscode/
+
+# firmware credentials — config.h picks these up via __has_include
+firmware/*/secrets.h
