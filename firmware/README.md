@@ -8,7 +8,7 @@ Board: **ESP32 DevKit V1** (ESP32-WROOM-32). Pin map below is for that board.
 |---|---|
 | SoftAP `SNTC-Enclosure` | Serves a captive portal showing a 6-char proximity code |
 | STA on campus WiFi | Uplink for MQTT — the AP itself has **no** internet route |
-| Publishes the code | `device/{uuid}/access/proximity_code`, rotated every 60 s |
+| Publishes the code | `device/{uuid}/access/proximity_code`, rotated every 5 min |
 | Obeys commands | `unlock_door`, `dispense`, `unlock` — with nonce replay protection |
 | Reports | door events, tamper, telemetry, heartbeat every 30 s |
 
@@ -70,29 +70,44 @@ screw each add a few degrees the model cannot see.
 
 The IIT Mandi network associates with no 802.1X and then intercepts every
 request until its login form is POSTed, so *associated* is not *online*. The
-firmware probes `connectivitycheck.gstatic.com/generate_204` and POSTs the login
-form when the probe comes back as anything other than a bare 204.
+firmware probes `connectivitycheck.gstatic.com/generate_204` and logs in when the
+probe comes back as anything other than a bare 204.
 
 Leave `PORTAL_LOGIN` at `0` for a network that just works once it associates —
 home Wi-Fi, a phone hotspot, a 4G MiFi.
 
-**Capture the real POST, don't guess it.** Log in from a laptop with devtools →
-Network open, find the login POST, and copy its URL and request body into
-`secrets.h`, replacing the username and password values with `%s` in that order:
+The portal is a **FortiGate**, captured off the live network rather than guessed,
+so `config.h` already carries the right endpoints, field names and TLS root. Only
+three defines belong in `secrets.h`:
 
 ```c
 #define PORTAL_LOGIN      1
-#define PORTAL_LOGIN_URL  "http://10.0.0.1:8090/login.xml"
-#define PORTAL_LOGIN_BODY "mode=191&username=%s&password=%s&a=0&producttype=0"
 #define PORTAL_USERNAME   "your-ldap-id"
 #define PORTAL_PASSWORD   "your-ldap-password"
 ```
 
-Both values are percent-encoded before substitution, so a password containing
-`&`, `+` or `%` is safe. Prove that path on the host without hardware:
+Login is a **two-step exchange**, not one POST. The form carries a hidden
+per-session `magic` token that rotates on every GET, so the firmware GETs
+`https://login.iitmandi.ac.in:1003/login?`, scrapes the magic, then POSTs
+`4Tredir` + `magic` + credentials to `https://login.iitmandi.ac.in:1003/`. A
+stale magic is rejected exactly as a wrong password is. All four values are
+percent-encoded, so a password containing `&`, `+` or `%` is safe. Both paths
+have a host self-check — no hardware needed:
 
 ```bash
 cc -Wall -Wextra -o /tmp/tu firmware/tools/test_urlencode.c && /tmp/tu
+cc -Wall -Wextra -o /tmp/ts firmware/tools/test_portal_scrape.c && /tmp/ts
+```
+
+The TLS leg is **verified**, not blind: `PORTAL_ROOT_CA` pins Go Daddy Root
+Certificate Authority - G2, which the portal's `*.iitmandi.ac.in` cert chains to.
+Never swap it for `setInsecure()` — an unverified socket hands the campus account
+to anyone who can answer on port 1003. If the campus ever changes CA, this fails
+first and tells you which root to paste in:
+
+```bash
+openssl s_client -connect login.iitmandi.ac.in:1003 \
+  -servername login.iitmandi.ac.in -CAfile gdroot.pem -no-CAstore -no-CApath
 ```
 
 Serial output on a portal network, at 115200:
@@ -104,21 +119,19 @@ Serial output on a portal network, at 115200:
 [mqtt] connected
 ```
 
-A portal that needs a CSRF token or a cookie from a prior GET will **not** work
-with this — the token is per-session and has to be scraped first.
+FortiGate answers **200 for a rejected login too** and just re-serves the form,
+so the HTTP status is not the verdict — the re-probe is. A bad credential reads:
 
-Two things worth knowing before you flash a personal credential:
+```
+[portal] login POST -> 200 (credential rejected)
+[portal] still blocked
+```
 
-- Flash reads out over USB with `esptool.py read_flash`. No soldering, no
-  exploit. Whoever opens the cabinet gets a working campus account, and if that
-  account is SSO they get mail with it. Ask IT for a service account or an IoT
-  MAC exemption first; failing that, rotate the credential when the project
-  ends.
-- If `PORTAL_LOGIN_URL` is `https`, `HTTPClient`'s single-argument `begin()`
-  calls `setInsecure()` — the certificate is **not** verified, so anyone on the
-  campus LAN can MITM the handshake and read the credential. Fixing that needs
-  the portal's own CA pinned in `config.h`, and self-signed portals can't be
-  pinned usefully at all.
+One thing worth knowing before you flash a personal credential: flash reads out
+over USB with `esptool.py read_flash`. No soldering, no exploit. Whoever opens
+the cabinet gets a working campus account, and if that account is SSO they get
+mail with it. Ask IT for a service account or an IoT MAC exemption first; failing
+that, rotate the credential when the project ends.
 
 The login only runs while MQTT is down. A live MQTT session is itself proof the
 portal session is open, and its keepalives are what hold it open — so in steady

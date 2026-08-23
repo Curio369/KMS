@@ -126,7 +126,7 @@
     <section class="code-panel" aria-live="polite">
       <p>Proximity code</p>
       <div id="code" class="pending">Reading…</div>
-      <p id="code-note">Only readable at the cabinet. Rotates every 60 seconds.</p>
+      <p id="code-note">Only readable at the cabinet.</p>
     </section>
 
     <section class="handoff" aria-live="polite">
@@ -191,6 +191,13 @@
         if (!response.ok || !body.code) throw new Error(body.error || 'no code');
         codeEl.textContent = body.code;
         codeEl.classList.remove('pending');
+        // Read the remaining life off the response rather than restating
+        // CODE_ROTATE_MS here — a second copy of the number silently goes stale
+        // the day the firmware constant changes.
+        if (body.rotates_in_ms > 0) {
+          const mins = Math.ceil(body.rotates_in_ms / 60000);
+          codeNote.textContent = `Only readable at the cabinet. New code in ~${mins} min.`;
+        }
         return body.code;
       } catch (_) {
         codeEl.textContent = 'Unavailable';

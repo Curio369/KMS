@@ -40,7 +40,12 @@ class Settings(BaseSettings):
     # ── Auth ──────────────────────────────────────────────────────
     session_ttl_seconds: int = 3600          # 1 hour
     cookie_secure: bool = True
-    proximity_code_ttl_seconds: int = 120    # 2 minutes
+    # Must stay LONGER than the firmware's CODE_ROTATE_MS, otherwise a code can
+    # expire in Redis before the cabinet mints its replacement and there is a
+    # window where the code on the portal screen is already dead. 6 min TTL
+    # against a 5 min rotation leaves the displayed code at least 60 s of life,
+    # which is what the walk-outside-and-switch-networks handoff needs.
+    proximity_code_ttl_seconds: int = 360    # 6 minutes
     proximity_flag_ttl_seconds: int = 300    # 5 minutes
     login_max_attempts: int = 5
     login_lockout_seconds: int = 900         # 15 minutes

@@ -280,7 +280,12 @@
 // re-seeds its Redis cache from the broker instead of waiting for a rotation.
 #define CODE_ALPHABET   "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  // no O/0, I/1/l
 #define CODE_LENGTH     6
-#define CODE_ROTATE_MS  60000UL         // new code every 60 s
+#define CODE_ROTATE_MS  300000UL        // new code every 5 min. The reader has to
+                                        // leave the AP, switch to mobile data,
+                                        // log in, pass TOTP and pick a key
+                                        // before spending it — 60 s did not
+                                        // cover that. Keep the backend's
+                                        // proximity_code_ttl_seconds above this.
 #define HEARTBEAT_MS    30000UL         // heartbeat + telemetry every 30 s
 #define NONCE_CACHE     64              // replay-protection history size
 
