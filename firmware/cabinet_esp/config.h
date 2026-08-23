@@ -41,6 +41,13 @@
 #ifndef STA_PASSWORD
 #define STA_PASSWORD       "replace-with-upstream-password"
 #endif
+// Regulatory domain for the station scan. The ESP32 defaults to world-safe
+// mode, which only *scans* channels 1-11 — so an AP on channel 12 or 13 is
+// invisible and WiFi.status() reports WL_NO_SSID_AVAIL forever, exactly as a
+// wrong SSID would. India allows 1-13, and the campus APs use 13.
+#ifndef STA_COUNTRY
+#define STA_COUNTRY        "IN"
+#endif
 #endif
 
 #define STA_RETRY_INTERVAL_MS 10000UL

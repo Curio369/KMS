@@ -42,6 +42,7 @@
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_wifi.h>
 #include <AsyncTCP.h>
 // Must precede ESPAsyncWebServer.h: that header gates its JSON support on
 // __has_include("ArduinoJson.h"), and the Arduino builder only puts ArduinoJson
@@ -699,8 +700,14 @@ static void onProximityCode(AsyncWebServerRequest *request) {
   copyCode(code);
 
   char body[96];
-  snprintf(body, sizeof body, "{\"code\":\"%s\",\"rotates_in_ms\":%lu}", code,
-           (unsigned long)(CODE_ROTATE_MS - (millis() - lastCodeRotate)));
+  // online says whether this code can actually be redeemed. A code only reaches
+  // Redis through publishCode(), which no-ops while MQTT is down, so a portal
+  // that shows one regardless sends the member off to the website to be told
+  // "proximity code invalid" with no hint the cabinet is what is broken.
+  snprintf(body, sizeof body,
+           "{\"code\":\"%s\",\"rotates_in_ms\":%lu,\"online\":%d}", code,
+           (unsigned long)(CODE_ROTATE_MS - (millis() - lastCodeRotate)),
+           mqtt.connected() ? 1 : 0);
   request->send(200, "application/json", body);
 }
 
@@ -735,6 +742,9 @@ void setup() {
   Serial.printf("Started AP %s, IP: %s\n", apSsid.c_str(), apIP.toString().c_str());
 
 #if KMS_STA_CONFIGURED
+  // Widen the scan range before the first begin(). Must come after
+  // WiFi.mode(), which is what actually initialises esp_wifi.
+  esp_wifi_set_country_code(STA_COUNTRY, true);
   WiFi.begin(STA_SSID, STA_PASSWORD);
   lastStaAttempt = millis();
   Serial.printf("Starting upstream Wi-Fi: %s\n", STA_SSID);
@@ -827,6 +837,11 @@ void loop() {
     }
     if (millis() - lastStaAttempt >= STA_RETRY_INTERVAL_MS) {
       lastStaAttempt = millis();
+      // Say why. A failed association is otherwise completely silent, and the
+      // portal login never runs without it — so "no internet" reads as an LDAP
+      // problem when it is really status 1 (no AP found) or 4 (auth rejected).
+      Serial.printf("[sta] %s not up (status %d), retrying\n", STA_SSID,
+                    (int)WiFi.status());
       WiFi.begin(STA_SSID, STA_PASSWORD);
     }
   }

@@ -189,6 +189,13 @@
         });
         const body = await response.json();
         if (!response.ok || !body.code) throw new Error(body.error || 'no code');
+        // A code the cabinet never published cannot be redeemed — the website
+        // would only answer "proximity code invalid". Name the real fault here.
+        if (!body.online) {
+          codeEl.textContent = 'Offline';
+          codeNote.textContent = 'Cabinet has no internet yet, so this code would be rejected. Wait a moment and reload.';
+          return null;
+        }
         codeEl.textContent = body.code;
         codeEl.classList.remove('pending');
         // Read the remaining life off the response rather than restating
@@ -217,6 +224,8 @@
         if (!response.ok || !body.token) throw new Error(body.error || 'Login failed');
         sessionStorage.setItem('kms_esp_session', body.token);
         const code = await loadProximityCode(body.token);
+        // No usable code means no point sending the phone off the AP.
+        if (!code) return;
         await loadPortalConfig();
         const destination = window.KMS.websiteUrl || continueLink.href;
         handoffCopy.textContent = 'Opening KMS Operating…';
