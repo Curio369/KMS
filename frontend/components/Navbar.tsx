@@ -37,7 +37,8 @@ export default function Navbar() {
     <header className="navbar-wrapper">
       <div className="navbar-pill">
         <Link href="/" className="navbar-brand">
-          <span>Robotronics</span>
+          <span>SnTC</span>
+          <span className="navbar-brand-sub">Key System</span>
         </Link>
         {user && (
           <div className="navbar-user-summary" aria-label="Logged-in user details">

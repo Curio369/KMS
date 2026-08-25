@@ -297,14 +297,15 @@
 #define NONCE_CACHE     64              // replay-protection history size
 
 // --- Rack geometry ----------------------------------------------------------
-// The Uno speaks absolute ANGLE:<deg>. Slot n (1-based) sits at SLOT_ANGLES[n-1]
-// plus SLOT_ANGLE_OFFSET. Trim the offset once against the real rack — a belt,
-// a coupler and a set screw all add a few degrees the model cannot see.
-#define SLOT_COUNT          8
-#define SLOT_ANGLES         { 0, 45, 90, 135, 180, 225, 270, 315 }
-#ifndef SLOT_ANGLE_OFFSET
-#define SLOT_ANGLE_OFFSET   0
-#endif
+// This end sends "SLOT:<n>" and nothing more. It does NOT know the gearing, the
+// microstep setting or how many steps a slot is worth — all of that lives in
+// firmware/KMS_LowLevel_ArduinoUno/rack_geometry.h, on the board that actually
+// drives the motor. Re-gear the rack and only the Uno gets reflashed.
+//
+// SLOT_COUNT is duplicated here for one job: rejecting an out-of-range slot
+// before it costs a UART round trip. Keep it equal to the Uno's SLOT_COUNT.
+// The Uno range-checks again on arrival, so a mismatch is caught, not obeyed.
+#define SLOT_COUNT          24
 
 // How long the solenoid stays engaged to drop one key, and how long to wait for
 // the Uno's DONE before declaring the dispense failed.

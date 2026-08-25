@@ -73,8 +73,6 @@ WiFiClient net;
 #endif
 PubSubClient mqtt(net);
 
-static const int SLOT_ANGLE[SLOT_COUNT] = SLOT_ANGLES;
-
 // Lines waiting to go out on the UART. Written by the AsyncTCP task, read by
 // loop(), which is the only context that touches Serial1.
 static QueueHandle_t txQueue;
@@ -176,7 +174,7 @@ static bool queueLine(const char *verb, const char *arg) {
   proto_parse(line, &c);
   if (!c.ok) return false;
   switch (c.verb) {
-    case PCMD_GOTO: case PCMD_ANGLE: case PCMD_ACTUATE:
+    case PCMD_SLOT: case PCMD_GOTO: case PCMD_ANGLE: case PCMD_ACTUATE:
     case PCMD_BATT_Q: case PCMD_STATUS_Q:
       break;
     default:
@@ -446,9 +444,13 @@ static bool startDispense(int slot, const char *nonce) {
   if (dispState != DISP_IDLE) return false;          // one at a time
   if (slot < 1 || slot > SLOT_COUNT) return false;
 
-  char angle[16];
-  snprintf(angle, sizeof angle, "%d", SLOT_ANGLE[slot - 1] + SLOT_ANGLE_OFFSET);
-  if (!queueLine("ANGLE", angle)) return false;
+  // Send the slot number, not a position. The Uno owns the gearing and the
+  // microstep setting, so it is the only board that can turn "slot 7" into a
+  // step target — and the only board that has to be reflashed when the
+  // mechanics change.
+  char slotArg[8];
+  snprintf(slotArg, sizeof slotArg, "%d", slot);
+  if (!queueLine("SLOT", slotArg)) return false;
 
   dispSlot = slot;
   snprintf(dispNonce, sizeof dispNonce, "%s", nonce);
@@ -621,6 +623,7 @@ static void onAction(AsyncWebServerRequest *request, JsonVariant &json) {
     ProtoCmd c;
     proto_parse(raw, &c);
     switch (c.verb) {
+      case PCMD_SLOT:      queued = c.ok && queueLine("SLOT", c.arg);    break;
       case PCMD_GOTO:      queued = c.ok && queueLine("GOTO", c.arg);    break;
       case PCMD_ANGLE:     queued = c.ok && queueLine("ANGLE", c.arg);   break;
       case PCMD_ACTUATE:   queued = c.ok && queueLine("ACTUATE", c.arg); break;
@@ -636,7 +639,15 @@ static void onAction(AsyncWebServerRequest *request, JsonVariant &json) {
   const char *cmd = json["cmd"].as<const char *>();
   if (!cmd) { sendErr(request, 400, "no_cmd"); return; }
 
-  if (!strcmp(cmd, "GOTO")) {
+  if (!strcmp(cmd, "SLOT")) {
+    // Bench equivalent of a dispense move, without the solenoid or the nonce.
+    if (!json["slot"].is<long>()) { sendErr(request, 400, "bad_slot"); return; }
+    const long slot = json["slot"].as<long>();
+    if (slot < 1 || slot > SLOT_COUNT) { sendErr(request, 400, "bad_slot"); return; }
+    char slotArg[8];
+    snprintf(slotArg, sizeof slotArg, "%ld", slot);
+    queued = queueLine("SLOT", slotArg);
+  } else if (!strcmp(cmd, "GOTO")) {
     if (!json["pos"].is<long>()) { sendErr(request, 400, "bad_pos"); return; }
     char pos[16];
     snprintf(pos, sizeof pos, "%ld", (long)json["pos"].as<long>());

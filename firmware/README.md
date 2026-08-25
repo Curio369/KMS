@@ -63,8 +63,29 @@ and empty the rack. Re-check the chain before flashing a fleet:
 openssl s_client -connect <host>:8883 -showcerts </dev/null
 ```
 
-Trim `SLOT_ANGLE_OFFSET` once against the real rack. A belt, a coupler and a set
-screw each add a few degrees the model cannot see.
+### Where the rack geometry lives
+
+The ESP32 sends `SLOT:<n>` and knows nothing else about the mechanics. Slot
+count, microstepping and the slot-to-step arithmetic all live in
+`firmware/KMS_LowLevel_ArduinoUno/rack_geometry.h`, on the board that drives the
+motor. Re-gear the rack, move a belt, or change the TB6600 DIP switches and only
+the Uno is reflashed.
+
+The rack is a **24-slot carousel**: one stepper, one solenoid, 15° between
+adjacent keys. `SLOT_COUNT` appears in three places and all three must agree —
+`rack_geometry.h`, `cabinet_esp/config.h` (used only to reject a bad slot early),
+and the `key_slots` CHECK constraint in the database.
+
+Prove the arithmetic on your laptop before touching hardware:
+
+```bash
+gcc -Wall -Wextra -o /tmp/trg firmware/tools/test_rack_geometry.c && /tmp/trg
+```
+
+That test exists because the obvious formula is wrong. `(STEPS_PER_REV /
+SLOT_COUNT) * index` truncates `1600 / 24` to `66` and loses a third of a step
+per slot — 0.45° out by slot 3, and 3.6° out by slot 24, where a full revolution
+never closes. Multiply first, divide last.
 
 ### Campus captive portal
 
@@ -95,8 +116,8 @@ percent-encoded, so a password containing `&`, `+` or `%` is safe. Both paths
 have a host self-check — no hardware needed:
 
 ```bash
-cc -Wall -Wextra -o /tmp/tu firmware/tools/test_urlencode.c && /tmp/tu
-cc -Wall -Wextra -o /tmp/ts firmware/tools/test_portal_scrape.c && /tmp/ts
+gcc -Wall -Wextra -o /tmp/tu firmware/tools/test_urlencode.c && /tmp/tu
+gcc -Wall -Wextra -o /tmp/ts firmware/tools/test_portal_scrape.c && /tmp/ts
 ```
 
 The TLS leg is **verified**, not blind: `PORTAL_ROOT_CA` pins Go Daddy Root
@@ -146,19 +167,30 @@ alone.
 
 ### Arduino Uno side
 
-`DEBUG_VIA_USB` must be `false`. With it `true` the sketch reads USB Serial and
-never `commSerial`, so every command the ESP32 sends is silently discarded — the
-dispense path is dead even over the local AP.
+The sketch listens on **both** the ESP32 link and the USB serial monitor, at all
+times. There is no flag to set and no mode to be in the wrong one of.
+
+This used to be a `DEBUG_VIA_USB` switch that chose between the two, and it
+shipped set to `true` — meaning the Uno read USB and never `commSerial`, so
+every command the ESP32 sent was discarded with no error at either end. The
+dispense path was dead and the only symptom was "the ESP isn't talking to the
+Arduino". If you are resurrecting an older sketch and the link seems dead, that
+flag is the first thing to check.
+
+`VERBOSE_LOG` still exists but only controls how chatty the USB log is. It
+cannot break the link.
 
 ### Test it in layers
 
 ```bash
 # 1. pure-C headers, on the host — no hardware
-cc -o /tmp/tp firmware/tools/test_protocol.c && /tmp/tp
-cc -o /tmp/tn firmware/tools/test_nonce.c    && /tmp/tn
+gcc -o /tmp/tp  firmware/tools/test_protocol.c      && /tmp/tp
+gcc -o /tmp/tn  firmware/tools/test_nonce.c         && /tmp/tn
+gcc -o /tmp/trg firmware/tools/test_rack_geometry.c && /tmp/trg
 
-# 2. Uno alone, over USB with DEBUG_VIA_USB temporarily true
-#    send ANGLE:90 -> expect ACK: then DONE:
+# 2. Uno alone, over USB — no ESP32 needed, no flag to flip
+#    send SLOT:7 -> expect ACK:SLOT then DONE:SLOT, and the platter moves
+#    send SLOT:0 or SLOT:99 -> expect ERR:BAD_SLOT and no movement
 
 # 3. ESP alone: watch it publish
 mosquitto_sub -h <host> -p 8883 --capath /etc/ssl/certs \
@@ -207,9 +239,15 @@ read.
 Or skip the IDE entirely — `arduino-cli` is scriptable:
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32 kms_enclosure
-arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyUSB0 kms_enclosure
+# cabinet ESP32 (the gateway)
+arduino-cli compile --fqbn esp32:esp32:esp32 firmware/cabinet_esp
+arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyUSB0 firmware/cabinet_esp
 arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
+
+# Arduino Uno (the motor board)
+arduino-cli compile --fqbn arduino:avr:uno firmware/KMS_LowLevel_ArduinoUno
+arduino-cli upload  --fqbn arduino:avr:uno -p /dev/ttyACM0 firmware/KMS_LowLevel_ArduinoUno
+arduino-cli monitor -p /dev/ttyACM0 -c baudrate=9600
 ```
 
 Serial access needs your user in `dialout`: `sudo usermod -aG dialout $USER`,
@@ -229,13 +267,33 @@ then log out and back in.
 **Never use GPIO 6–11 on a WROOM-32 module** — they are wired to the internal
 SPI flash, and driving them crashes the chip into a boot loop.
 
+### Cabinet ESP32 (WROOM-32)
+
 | Signal | GPIO | Notes |
 |---|---|---|
 | Door lock driver | 4 | HIGH = unlocked. Use a MOSFET/relay, not the pin directly |
 | Tamper switch | 5 | NC to GND; opens (reads HIGH) when the enclosure is prised |
-| Slots 1–8 | 13,14,16,17,18,19,21,22 | `PIN_SLOTS[]` in the `.ino`, HIGH for 1.2 s to actuate |
+| UART TX → Uno pin 2 | 17 | 3.3 V out. The Uno reads this fine as-is |
+| UART RX ← Uno pin 3 | 16 | **Needs a level shifter** — the Uno drives 5 V into a 3.3 V pin |
+| GND ↔ Uno GND | — | Not optional. A missing common ground is the single most common reason the link appears dead |
 
-Change the `PIN_*` constants at the top of the `.ino` if your board differs.
+### Arduino Uno (motor board)
+
+| Signal | Pin | Notes |
+|---|---|---|
+| SoftwareSerial RX ← ESP32 TX | 2 | Pins 0/1 are the USB port, hence SoftwareSerial |
+| SoftwareSerial TX → ESP32 RX | 3 | Through the level shifter |
+| TB6600 PUL+ | 6 | `STEPPER_STEP_PIN` |
+| TB6600 DIR+ | 7 | `STEPPER_DIR_PIN`. PUL−/DIR− go to GND |
+| Solenoid relay | 4 | Drops one key. 5 s coil-duty ceiling enforced in firmware |
+| Battery tap | A0 | Through a divider; set `VBAT_DIVIDER_RATIO` to match |
+
+There is **no home or limit switch**. The Uno counts steps from wherever it
+powered up, so if it resets mid-shift every slot number points at the wrong key
+and nothing in software can tell. Park the rack at slot 1 before power-cycling,
+or add a switch.
+
+Change the `PIN_*` constants at the top of each sketch if your board differs.
 
 ## Testing without hardware
 

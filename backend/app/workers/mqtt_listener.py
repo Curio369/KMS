@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 
 from app.core.config import get_settings
 from app.core.database import AsyncSessionLocal
+from app.core.redis_client import get_redis, live_status_channel
 from app.models.access_log import AccessLog
 from app.models.device import Device
 from app.models.override_log import OverrideLog, OverrideTrigger
@@ -15,6 +17,7 @@ from app.services.mqtt_service import mqtt_client
 from app.services.proximity_service import ProximityService
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 async def run_mqtt_listener() -> None:
@@ -86,6 +89,27 @@ async def _handle_message(topic: str, payload: bytes) -> None:
             )
             db.add(log)
             await db.commit()
+
+            # Tell the browser the rack finished. Until this existed the chain
+            # stopped here: the Uno reported DONE, the ESP32 published
+            # "dispensed", this handler wrote a log row — and the page still
+            # showed whatever it had, because nothing woke the WebSocket.
+            #
+            # The client refetches on any message rather than parsing the
+            # payload (frontend/app/keys/page.tsx), so the body is for humans
+            # reading Redis, not for the UI.
+            try:
+                redis = get_redis()
+                await redis.publish(
+                    live_status_channel(),
+                    f"rack_{event}:{device_id}:{slot_number}",
+                )
+            except Exception:
+                # A dead Redis must not stop the audit log from being written —
+                # that already happened above, and it is the record that matters.
+                logger.exception(
+                    "Live-status publish failed for %s slot %s", device_id, slot_number
+                )
 
         elif "power/telemetry" in topic:
             await _update_device_telemetry(db, device_id, data)

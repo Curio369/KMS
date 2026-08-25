@@ -54,8 +54,16 @@ DEMO_ROOMS = [
     ("SAC A-20", "SAC", "Component store"),
 ]
 
-# slot_number -> index into DEMO_ROOMS (None = unassigned spare)
-SLOT_MAP = {1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: None, 7: None, 8: None}
+# The carousel carries 24 keys. Must not exceed SLOT_COUNT in
+# firmware/KMS_LowLevel_ArduinoUno/rack_geometry.h, nor the CHECK constraint on
+# key_slots — seeding past either is an IntegrityError, not a silent truncation.
+SLOT_COUNT = 24
+
+# slot_number -> index into DEMO_ROOMS (None = unassigned spare).
+# Slots 1-3 and 4-5 are assigned so the demo member has something to retrieve;
+# the rest are left spare, which is also what a freshly built rack looks like.
+SLOT_MAP = {n: None for n in range(1, SLOT_COUNT + 1)}
+SLOT_MAP.update({1: 0, 2: 0, 3: 0, 4: 1, 5: 1})
 
 
 async def seed(reset: bool = False) -> None:

@@ -6,7 +6,9 @@
   Commands are terminated by a newline '\n'
 
   High -> Low Commands:
-  - GOTO:<position>   -> Move stepper to <position>
+  - SLOT:<n>          -> Move to key slot <n>, 1-based. PREFERRED.
+  - GOTO:<position>   -> Move stepper to <position>, in raw steps
+  - ANGLE:<degrees>   -> Move stepper to an angle in whole degrees
   - ACTUATE:<1/0>     -> Engage(1) or Disengage(0) the solenoid
   - BATT:?            -> Request battery percentage
   - STATUS:?          -> Request system status
@@ -37,6 +39,12 @@ enum SystemState { STATE_IDLE, STATE_MOVING, STATE_ERROR };
       "BATT:87" answers). The param disambiguates; the verb alone cannot.
    4. Lines are bounded. PROTO_MAX_LINE lets both ends use fixed buffers and
       drop malloc from the RX path entirely.
+   5. SLOT is the command the rack actually uses. The high level knows which
+      key the member asked for; only the low level knows the gearing, the
+      microstep setting and therefore how many steps a slot is worth. Sending
+      the slot number keeps that knowledge in exactly one place — reflashing
+      the Uno after a mechanical change never touches the ESP32. GOTO and
+      ANGLE stay for bench work.
 
    Pure C on purpose — no Arduino types — so firmware/tools/test_protocol.c
    can compile and exercise this parser on the host.
@@ -51,7 +59,9 @@ enum SystemState { STATE_IDLE, STATE_MOVING, STATE_ERROR };
 typedef enum {
   PCMD_NONE = 0,     /* blank line — ignore, not an error                    */
   /* High -> Low */
+  PCMD_SLOT,         /* num = target key slot, 1-based                        */
   PCMD_GOTO,         /* num = target position                                */
+  PCMD_ANGLE,        /* num = target angle in whole degrees                   */
   PCMD_ACTUATE,      /* num = 1 engage / 0 disengage                         */
   PCMD_BATT_Q,       /* "BATT:?"                                            */
   PCMD_STATUS_Q,     /* "STATUS:?"                                          */
@@ -130,8 +140,17 @@ static inline void proto_parse(const char *line, ProtoCmd *out) {
 
   if (vlen == 0) return;  /* blank or ":foo" — PCMD_NONE */
 
-  if (vlen == 4 && !strncmp(line, "GOTO", 4)) {
+  if (vlen == 4 && !strncmp(line, "SLOT", 4)) {
+    out->verb = PCMD_SLOT;
+    /* Lower bound only. The upper bound is SLOT_COUNT, which is a property of
+       the rack and lives in the low level's config.h — this parser is shared
+       by both ends and must not pretend to know it. */
+    out->ok = proto_strict_long(out->arg, &out->num) && out->num >= 1;
+  } else if (vlen == 4 && !strncmp(line, "GOTO", 4)) {
     out->verb = PCMD_GOTO;
+    out->ok = proto_strict_long(out->arg, &out->num);
+  } else if (vlen == 5 && !strncmp(line, "ANGLE", 5)) {
+    out->verb = PCMD_ANGLE;
     out->ok = proto_strict_long(out->arg, &out->num);
   } else if (vlen == 7 && !strncmp(line, "ACTUATE", 7)) {
     out->verb = PCMD_ACTUATE;

@@ -45,6 +45,29 @@ int main(void) {
   assert(!proto_strict_long("99999999999999", &v));
   assert(!proto_strict_long(NULL, &v));
 
+  /* --- SLOT -------------------------------------------------------------- */
+  c = P("SLOT:1");
+  assert(c.verb == PCMD_SLOT && c.ok && c.num == 1);
+  c = P("SLOT:24");
+  assert(c.verb == PCMD_SLOT && c.ok && c.num == 24);
+
+  /* Slots are 1-based, so 0 and negatives are malformed rather than "slot
+     zero". A silent 0 would send the platter home and hand out the wrong
+     key — the same class of bug proto_strict_long() exists to prevent. */
+  c = P("SLOT:0");
+  assert(c.verb == PCMD_SLOT && !c.ok);
+  c = P("SLOT:-3");
+  assert(c.verb == PCMD_SLOT && !c.ok);
+  c = P("SLOT:abc");
+  assert(c.verb == PCMD_SLOT && !c.ok);
+  c = P("SLOT:");
+  assert(c.verb == PCMD_SLOT && !c.ok);
+
+  /* The upper bound belongs to the sketch, not the parser: it depends on
+     SLOT_COUNT, which this shared header deliberately does not know. */
+  c = P("SLOT:9999");
+  assert(c.verb == PCMD_SLOT && c.ok && c.num == 9999);
+
   /* --- GOTO ------------------------------------------------------------- */
   c = P("GOTO:1200");
   assert(c.verb == PCMD_GOTO && c.ok && c.num == 1200);

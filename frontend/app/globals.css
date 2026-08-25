@@ -150,13 +150,23 @@ a:hover { color: var(--c-accent); }
 }
 .navbar-brand {
   display: flex;
-  align-items: center;
-  gap: 0.6rem;
+  align-items: baseline;
+  gap: 0.45rem;
   font-weight: 800;
   font-size: 1.05rem;
   color: var(--c-text);
   text-decoration: none;
   letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+/* Second half of the wordmark. Dropped on the narrowest phones (see the 480px
+   block) where the pill has to fit a hamburger and a theme toggle too. */
+.navbar-brand-sub {
+  font-weight: 500;
+  font-size: 0.78rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
 }
 .navbar-user-summary { display: flex; align-items: center; gap: 0.65rem; padding: 0.35rem 0.75rem; border-left: 1px solid var(--c-border); color: var(--c-text-muted); font-size: 0.68rem; white-space: nowrap; }
 .navbar-user-summary strong { color: var(--c-text); font-size: 0.75rem; }
@@ -740,6 +750,103 @@ td { padding: 0.875rem 1rem; font-size: 0.875rem; }
   margin: 0.35rem 0 0;
 }
 
+/* ── How it works ────────────────────────────────────────────────────────── */
+.how {
+  background: var(--c-bg2);
+  border-top: 1px solid var(--c-border);
+  /* The home navbar is `fixed`, so an anchor jump would land the heading
+     underneath it without this. */
+  scroll-margin-top: 5rem;
+}
+.how-inner {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 6rem 2rem;
+}
+.how-eyebrow {
+  font-size: 0.8rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--c-accent);
+  margin: 0;
+}
+.how-heading {
+  font-family: 'Instrument Serif', serif;
+  font-weight: 400;
+  font-size: clamp(2rem, 5vw, 3.25rem);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  color: var(--c-text);
+  margin: 1rem 0 0;
+}
+.how-lede {
+  font-size: 1.0625rem;
+  line-height: 1.7;
+  color: var(--c-text-muted);
+  max-width: 62ch;
+  margin: 1.25rem 0 0;
+}
+
+.how-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1.25rem;
+  list-style: none;
+  padding: 0;
+  margin: 3rem 0 0;
+  /* Counter-free: the number is real text so screen readers can skip it via
+     aria-hidden while sighted users still get the ordinal. */
+  counter-reset: none;
+}
+.how-step {
+  position: relative;
+  padding: 1.75rem 1.5rem 1.5rem;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-lg);
+  background: var(--c-bg);
+  transition: border-color var(--transition), transform var(--transition);
+}
+.how-step:hover {
+  border-color: var(--c-border-light);
+  transform: translateY(-2px);
+}
+.how-step-num {
+  font-family: 'Instrument Serif', serif;
+  font-size: 2.25rem;
+  line-height: 1;
+  color: var(--c-accent);
+  opacity: 0.55;
+}
+.how-step-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  margin: 1rem 0 0;
+}
+.how-step-title {
+  font-size: 1.0625rem;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--c-text);
+  margin: 0.4rem 0 0;
+}
+.how-step-body {
+  font-size: 0.9375rem;
+  line-height: 1.65;
+  color: var(--c-text-muted);
+  margin: 0.75rem 0 0;
+}
+.how-foot {
+  font-size: 0.95rem;
+  line-height: 1.7;
+  color: var(--c-text-muted);
+  max-width: 68ch;
+  margin: 2.5rem 0 0;
+}
+
 /* ── Council ─────────────────────────────────────────────────────────────── */
 .council {
   background: var(--c-bg);
@@ -831,10 +938,14 @@ td { padding: 0.875rem 1rem; font-size: 0.875rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .hero-btn:hover, .hero-btn:active, .club-card:hover { transform: none; }
+  .hero-btn:hover, .hero-btn:active, .club-card:hover, .how-step:hover { transform: none; }
+  html { scroll-behavior: auto; }
 }
 
 @media (max-width: 768px) {
+  .how-inner { padding: 4rem 1.5rem; }
+  .how-steps { grid-template-columns: 1fr; gap: 1rem; margin-top: 2.25rem; }
+  .how-step { padding: 1.5rem 1.25rem 1.25rem; }
   .hero-inner { padding: 5rem 1.5rem 4rem; }
   .hero-actions { flex-direction: column; }
   .hero-btn { width: 100%; max-width: 320px; padding: 18px 40px; }
@@ -856,6 +967,7 @@ td { padding: 0.875rem 1rem; font-size: 0.875rem; }
   .navbar-wrapper { top: 0.5rem; padding: 0 0.75rem; }
   .navbar-pill { position: relative; padding: 0.5rem 0.65rem 0.5rem 0.9rem; gap: 0.5rem; border-radius: 14px; }
   .navbar-brand { font-size: 0.95rem; }
+  .navbar-brand-sub { display: none; }
   .navbar-user-summary { display: none; }
   .navbar-menu-toggle { display: grid; gap: 4px; width: 36px; height: 36px; place-content: center; border: 1px solid var(--c-border); background: var(--c-bg2); color: var(--c-text); cursor: pointer; }
   .navbar-menu-toggle span { display: block; width: 16px; height: 2px; background: currentColor; }
