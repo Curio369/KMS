@@ -75,7 +75,7 @@ services:
       MQTT_TLS: "false"
       # The broker is up, but nothing publishes proximity codes without a real
       # enclosure. Flip to true when you have one on the LAN.
-      MQTT_ENABLED: "false"
+      MQTT_ENABLED: "true"
       ALLOWED_ORIGINS: http://localhost:3000
       # Enables /docs. Local only — it also loosens error detail.
       DEBUG: "true"

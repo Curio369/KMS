@@ -32,9 +32,17 @@
 #define SLOT_COUNT 24
 #endif
 
-/* Slot 1 sits at step 0. If slot 1 is one position out on the real rack, this
-   is the line to change — not the backend, and not the ESP32. */
-#define SLOT_TO_INDEX(slot) ((slot) - 1)
+/* Slot 1 is defined to sit at step 0, but the real rack's physical home
+   position is whatever it was when it was last assembled/homed — it does not
+   know about this firmware's numbering. HOME_OFFSET_SLOTS corrects for that
+   mismatch: increase it by 1 for each slot the rack is rotated short of where
+   the firmware thinks slot 1 is (e.g. requesting slot 5 landing on slot 4's
+   physical position means the rack is one slot short -> HOME_OFFSET_SLOTS 1).
+   Change this here — not the backend, and not the ESP32. */
+#ifndef HOME_OFFSET_SLOTS
+#define HOME_OFFSET_SLOTS 1
+#endif
+#define SLOT_TO_INDEX(slot) ((((slot) - 1) + HOME_OFFSET_SLOTS) % SLOT_COUNT)
 
 /* Absolute step target for a 1-based slot number.
 

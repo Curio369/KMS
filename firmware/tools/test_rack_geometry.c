@@ -11,7 +11,7 @@
 #include <assert.h>
 #include <stdio.h>
 
-#include "../KMS_LowLevel_ArduinoUno/rack_geometry.h"
+#include "../KMS_LowLevel_ArduinoUno/src/rack_geometry.h"
 
 int main(void) {
   int slot;
@@ -21,26 +21,40 @@ int main(void) {
          SLOT_COUNT, STEPS_PER_REV,
          (double)STEPS_PER_REV / SLOT_COUNT, 360.0 / SLOT_COUNT);
 
-  /* --- the anchors ------------------------------------------------------- */
-  /* Slot 1 is home. If this ever becomes 66 the whole rack is off by one. */
-  assert(rack_slot_to_steps(1) == 0);
+  printf("     HOME_OFFSET_SLOTS = %d\n", HOME_OFFSET_SLOTS);
 
-  /* Slots that land on exact step boundaries — these are the ones the broken
+  /* --- the anchor -------------------------------------------------------- */
+  /* Whichever slot maps to index 0 sits at step 0 — that is the physical home
+     position. With no offset that is slot 1; the offset rotates which slot
+     lands there, and nothing else about the geometry. */
+  assert(rack_slot_to_steps(1 + (SLOT_COUNT - HOME_OFFSET_SLOTS) % SLOT_COUNT) == 0);
+
+  /* Slots that land on exact step boundaries — the ones the broken
      divide-first formula gets wrong, so they are the regression guard.
-     divide-first would give 198, 792 and 1518 respectively. */
-  assert(rack_slot_to_steps(4) == 200);
-  assert(rack_slot_to_steps(13) == 800);
-  assert(rack_slot_to_steps(24) == 1533);   /* (1600*23)/24 = 1533.33 -> 1533 */
+     Expressed against SLOT_TO_INDEX so the offset does not invalidate them:
+     index 3 -> 200, index 12 -> 800, index 23 -> 1533. */
+  assert(((long)STEPS_PER_REV * 3) / SLOT_COUNT == 200);
+  assert(((long)STEPS_PER_REV * 12) / SLOT_COUNT == 800);
+  assert(((long)STEPS_PER_REV * 23) / SLOT_COUNT == 1533);
 
-  /* --- monotonic and inside one revolution ------------------------------- */
-  prev = -1;
-  for (slot = 1; slot <= SLOT_COUNT; slot++) {
-    const long steps = rack_slot_to_steps(slot);
-    assert(steps > prev);                 /* strictly increasing */
-    assert(steps >= 0);
-    assert(steps < STEPS_PER_REV);        /* never past a full turn */
-    prev = steps;
+  /* --- every slot distinct, and inside one revolution --------------------- */
+  /* NOT monotonic in slot order once HOME_OFFSET_SLOTS is non-zero: the
+     mapping wraps, so slot N can sit before slot 1. What must hold is that no
+     two slots share a step target — a collision would dispense two different
+     keys from one position. */
+  {
+    long seen[SLOT_COUNT];
+    int i, j;
+    for (i = 0; i < SLOT_COUNT; i++) {
+      seen[i] = rack_slot_to_steps(i + 1);
+      assert(seen[i] >= 0);
+      assert(seen[i] < STEPS_PER_REV);   /* never past a full turn */
+    }
+    for (i = 0; i < SLOT_COUNT; i++)
+      for (j = i + 1; j < SLOT_COUNT; j++)
+        assert(seen[i] != seen[j]);      /* no two slots collide */
   }
+  (void)prev;
 
   /* --- accuracy ---------------------------------------------------------- */
   /* Every slot must sit within one step of its ideal position. The

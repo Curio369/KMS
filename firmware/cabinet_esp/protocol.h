@@ -10,6 +10,7 @@
   - GOTO:<position>   -> Move stepper to <position>, in raw steps
   - ANGLE:<degrees>   -> Move stepper to an angle in whole degrees
   - ACTUATE:<1/0>     -> Engage(1) or Disengage(0) the solenoid
+  - HOME:?            -> Seek the home switch and zero position at slot 1
   - BATT:?            -> Request battery percentage
   - STATUS:?          -> Request system status
 
@@ -21,7 +22,7 @@
   - STATUS:<state>    -> Status response (IDLE, MOVING, ERROR)
 */
 
-enum SystemState { STATE_IDLE, STATE_MOVING, STATE_ERROR };
+enum SystemState { STATE_IDLE, STATE_MOVING, STATE_ERROR, STATE_HOMING };
 
 /* ---------------------------------------------------------------------------
    Everything below implements the contract above. The prose leaves four things
@@ -63,6 +64,7 @@ typedef enum {
   PCMD_GOTO,         /* num = target position                                */
   PCMD_ANGLE,        /* num = target angle in whole degrees                   */
   PCMD_ACTUATE,      /* num = 1 engage / 0 disengage                         */
+  PCMD_HOME,         /* "HOME:?" — seek the home switch, zero at slot 1      */
   PCMD_BATT_Q,       /* "BATT:?"                                            */
   PCMD_STATUS_Q,     /* "STATUS:?"                                          */
   /* Low -> High */
@@ -156,6 +158,10 @@ static inline void proto_parse(const char *line, ProtoCmd *out) {
     out->verb = PCMD_ACTUATE;
     out->ok = proto_strict_long(out->arg, &out->num)
               && (out->num == 0 || out->num == 1);
+  } else if (vlen == 4 && !strncmp(line, "HOME", 4)) {
+    /* No param validation needed — "HOME:?" and bare "HOME" both just mean
+       "go seek the switch". */
+    out->verb = PCMD_HOME;
   } else if (vlen == 4 && !strncmp(line, "BATT", 4)) {
     /* "BATT:?" / "BATT" = query; "BATT:87" = the answer coming back. */
     if (out->arg[0] == '\0' || !strcmp(out->arg, "?")) {
@@ -173,6 +179,7 @@ static inline void proto_parse(const char *line, ProtoCmd *out) {
       if      (!strcmp(out->arg, "IDLE"))   out->num = STATE_IDLE;
       else if (!strcmp(out->arg, "MOVING")) out->num = STATE_MOVING;
       else if (!strcmp(out->arg, "ERROR"))  out->num = STATE_ERROR;
+      else if (!strcmp(out->arg, "HOMING")) out->num = STATE_HOMING;
       else out->ok = 0;
     }
   } else if (vlen == 3 && !strncmp(line, "ACK", 3)) {
@@ -207,7 +214,12 @@ static inline size_t proto_fmt(char *buf, size_t cap,
 }
 
 static inline const char *proto_state_name(enum SystemState s) {
-  return s == STATE_IDLE ? "IDLE" : (s == STATE_MOVING ? "MOVING" : "ERROR");
+  switch (s) {
+    case STATE_IDLE:   return "IDLE";
+    case STATE_MOVING: return "MOVING";
+    case STATE_HOMING: return "HOMING";
+    default:           return "ERROR";
+  }
 }
 
 #endif /* PROTOCOL_H */

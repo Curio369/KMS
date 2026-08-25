@@ -122,6 +122,14 @@ static char      dispNonce[NONCE_STR_MAX] = "";
 // the reply handler in the file and avoids a forward declaration.
 static bool      dispDoneSeen = false;
 
+// True once the Uno has confirmed it physically reached the home switch.
+// Before that, its position counter is just "wherever it was at boot" — SLOT
+// moves would be relative to an unverified reference. queueLine("HOME","?")
+// is enqueued once in setup(), and startDispense() refuses to move the rack
+// until handleReply() sees this flip true, so "slot 4" can never silently
+// mean the wrong physical slot.
+static bool      lowLevelHomed = false;
+
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 static bool ctEqual(const uint8_t *a, const uint8_t *b, size_t n) {
@@ -175,7 +183,7 @@ static bool queueLine(const char *verb, const char *arg) {
   if (!c.ok) return false;
   switch (c.verb) {
     case PCMD_SLOT: case PCMD_GOTO: case PCMD_ANGLE: case PCMD_ACTUATE:
-    case PCMD_BATT_Q: case PCMD_STATUS_Q:
+    case PCMD_HOME: case PCMD_BATT_Q: case PCMD_STATUS_Q:
       break;
     default:
       return false;   // not a command this end is allowed to send
@@ -229,7 +237,29 @@ static void handleReply(const char *line) {
       // running concurrently with a dispense could satisfy the wrong wait; the
       // DISPENSE_TIMEOUT_MS ceiling means the worst case is one early solenoid
       // pulse, not a stuck rack. Tag commands with an id if that ever matters.
-      if (c.verb == PCMD_DONE) dispDoneSeen = true;
+      if (c.verb == PCMD_DONE) {
+        dispDoneSeen = true;
+        if (!strcmp(c.arg, "HOME")) {
+          lowLevelHomed = true;
+          Serial.println("[home] Uno confirmed home switch reached");
+        }
+      } else if (c.verb == PCMD_ERR && !strcmp(c.arg, "HOME_SWITCH_NOT_FOUND")) {
+        Serial.println("[home] Uno never found the home switch — dispensing stays blocked");
+      } else if (c.verb == PCMD_ERR && !strcmp(c.arg, "REBOOT")) {
+        // The Uno restarted underneath us. Its step counter is back at zero
+        // wherever the rack happens to be standing, so every slot target we
+        // would compute from here is measured from a reference that no longer
+        // exists — and nothing about that is visible from this end.
+        //
+        // This is not rare. Opening a serial monitor on the Uno toggles DTR
+        // and resets the ATmega, which happens constantly during bench work.
+        // Without this the rack keeps dispensing confidently from a dead
+        // reference and hands out the wrong key with no error anywhere.
+        lowLevelHomed = false;
+        dispState = DISP_IDLE;          // abandon any move that was in flight
+        queueLine("HOME", "?");
+        Serial.println("[home] Uno rebooted — position invalidated, re-homing");
+      }
       return;
     default:
       return;
@@ -441,6 +471,7 @@ static void publishRackEvent(const char *event, int slot, const char *nonce) {
 // ── Dispense sequencer ───────────────────────────────────────────────────────
 
 static bool startDispense(int slot, const char *nonce) {
+  if (!lowLevelHomed) return false;                   // unverified position — refuse
   if (dispState != DISP_IDLE) return false;          // one at a time
   if (slot < 1 || slot > SLOT_COUNT) return false;
 
@@ -523,7 +554,8 @@ static void onMessage(char *topic, byte *payload, unsigned int len) {
   const int slot = doc["slot_number"] | doc["slot_id"] | 0;
   if (!startDispense(slot, nonceStr)) {
     publishRackEvent("failed", slot, nonceStr);
-    Serial.printf("[mqtt] %s slot %d rejected (busy or out of range)\n", action, slot);
+    Serial.printf("[mqtt] %s slot %d rejected (%s)\n", action, slot,
+                  !lowLevelHomed ? "not homed yet" : "busy or out of range");
     return;
   }
   Serial.printf("[mqtt] %s slot %d\n", action, slot);
@@ -739,6 +771,12 @@ void setup() {
 
   Serial1.begin(COMM_BAUD_RATE, SERIAL_8N1, COMM_RX_PIN, COMM_TX_PIN);
   txQueue = xQueueCreate(8, PROTO_MAX_LINE);
+
+  // First thing sent to the Uno, every boot. Dispensing stays refused (see
+  // startDispense()) until handleReply() sees the matching DONE:HOME come
+  // back, so a SLOT move can never run against an unverified position.
+  queueLine("HOME", "?");
+  Serial.println("[home] queued HOME:? — dispensing blocked until the Uno confirms");
 
   if (!LittleFS.begin()) Serial.println("LittleFS mount failed");
 
