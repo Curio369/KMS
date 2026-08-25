@@ -245,6 +245,20 @@ static void handleReply(const char *line) {
         }
       } else if (c.verb == PCMD_ERR && !strcmp(c.arg, "HOME_SWITCH_NOT_FOUND")) {
         Serial.println("[home] Uno never found the home switch — dispensing stays blocked");
+      } else if (c.verb == PCMD_ERR && !strcmp(c.arg, "REBOOT")) {
+        // The Uno restarted underneath us. Its step counter is back at zero
+        // wherever the rack happens to be standing, so every slot target we
+        // would compute from here is measured from a reference that no longer
+        // exists — and nothing about that is visible from this end.
+        //
+        // This is not rare. Opening a serial monitor on the Uno toggles DTR
+        // and resets the ATmega, which happens constantly during bench work.
+        // Without this the rack keeps dispensing confidently from a dead
+        // reference and hands out the wrong key with no error anywhere.
+        lowLevelHomed = false;
+        dispState = DISP_IDLE;          // abandon any move that was in flight
+        queueLine("HOME", "?");
+        Serial.println("[home] Uno rebooted — position invalidated, re-homing");
       }
       return;
     default:

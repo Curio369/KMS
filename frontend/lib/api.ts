@@ -15,8 +15,17 @@ async function request<T>(
     ...options,
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw { status: res.status, ...err };
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    // FastAPI always wraps HTTPException(detail=...) as {"detail": ...}. Most
+    // routes pass a plain string there, but a few (require_proximity,
+    // slot_unavailable) pass a structured {"error": "code"} instead — nested
+    // one level deeper than callers here expect. Flatten that case so
+    // `err.error === "..."` checks work, and `err.detail` stays a string (or
+    // undefined) rather than an object React would refuse to render.
+    const detail = body.detail;
+    throw detail && typeof detail === "object"
+      ? { status: res.status, ...detail }
+      : { status: res.status, detail };
   }
   if (res.status === 204) return undefined as T;
   return res.json();

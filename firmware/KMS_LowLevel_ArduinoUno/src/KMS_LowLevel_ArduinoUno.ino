@@ -43,9 +43,30 @@
 //     system that knows how many steps a slot is worth.
 #include "rack_geometry.h"
 
-// --- Home Switch (slot 1 reference) ---
-//     Mechanical limit switch wired NC-to-GND with INPUT_PULLUP, so the pin
-//     reads HIGH when clear and LOW when the switch is pressed at slot 1.
+// --- Home Switch (rack reference position) ---
+//     Two wires, no external parts: D5 to the switch's NO terminal, the
+//     switch's COM terminal to GND. INPUT_PULLUP holds the pin HIGH while the
+//     switch is open; closing it to ground pulls the pin LOW, hence
+//     HOME_SWITCH_ACTIVE_STATE below.
+//
+//     Use the normally-OPEN contact. On a normally-closed one the sense
+//     inverts, so the pin reads "at home" everywhere except the one place it
+//     actually is, and homing stops immediately at the wrong position.
+//
+//     Mount the switch on the fixed frame and the trigger — a screw head or a
+//     tab — on the disc. The trigger does NOT need to line up with slot 1;
+//     HOME_OFFSET_SLOTS in rack_geometry.h exists to absorb that mismatch.
+//
+//     Check polarity with "SWITCH:?" before ever running "HOME:?": press the
+//     switch by hand and the reported value must flip. If it reads inverted,
+//     move the wire to NO, or flip HOME_SWITCH_ACTIVE_STATE to HIGH.
+//     Set HOME_SWITCH_FITTED to 0 if the rack has no switch yet. HOME:? then
+//     adopts the current position as the reference and answers DONE:HOME
+//     immediately, which is what the ESP32 waits for before it will dispense
+//     at all. Nothing is measured in that mode — park the rack at slot 1 by
+//     hand before power-up, and expect the numbering to drift after any reset.
+//     Set it back to 1 the moment a switch exists.
+#define HOME_SWITCH_FITTED 0
 #define HOME_SWITCH_PIN 5
 #define HOME_SWITCH_ACTIVE_STATE LOW
 #define HOME_SEEK_SPEED 800.0 // steps/sec, slower than normal moves for a clean stop
@@ -154,6 +175,14 @@ public:
   }
 
   bool didHomingFail() { return homingFailed; }
+
+  // Declare the current physical position to be `position`, without moving.
+  // Used by HOME:? on a rack with no switch fitted, where "home" can only mean
+  // "wherever you parked it".
+  void setCurrentPosition(long position) {
+    motor.moveTo(motor.currentPosition());  // cancel any pending travel first
+    motor.setCurrentPosition(position);
+  }
 
   void moveTo(long targetPosition) { motor.moveTo(targetPosition); }
 
@@ -409,6 +438,19 @@ void processCommand(String cmd) {
     Serial.println(")");
 
   } else if (command == "HOME") {
+#if !HOME_SWITCH_FITTED
+    // No switch on this rack. Adopt the current position as the reference and
+    // answer DONE:HOME so the ESP32's "refuse to dispense until homed" gate
+    // opens. This is a bench convenience, not homing: nothing has been
+    // measured, so slot numbering is only as correct as wherever you parked
+    // the rack by hand.
+    stepper.setCurrentPosition(0);
+    currentState = STATE_IDLE;
+    sendResponse("DONE:HOME");
+    Serial.println("HOME: no switch fitted — adopted current position as slot 1.");
+    Serial.println("WARNING: slot numbering is unverified. Park at slot 1 before power-up.");
+    return;
+#else
     if (stepper.atHomeSwitch()) {
       // Already sitting on the switch: zero immediately, nothing to seek.
       stepper.startHoming();
@@ -421,6 +463,7 @@ void processCommand(String cmd) {
       sendResponse("ACK:HOME");
     }
     Serial.println("Homing to slot 1 switch...");
+#endif
 
   } else if (command == "ACTUATE") {
     bool engage = (param.toInt() == 1);
@@ -475,6 +518,18 @@ void setup() {
   stepper.begin();
   solenoid.begin();
   battery.begin();
+
+  // Tell the ESP32 we restarted, on the link it actually listens to.
+  //
+  // The step counter is now zero wherever the rack physically stands, so any
+  // slot position the ESP32 still believes in is measured from a reference
+  // that no longer exists. It has no other way to notice: this board can
+  // reboot on its own (DTR toggle when a serial monitor opens, a brownout
+  // while the motor draws current, the reset button) while the ESP32 stays up
+  // the whole time and keeps thinking the rack is homed.
+  //
+  // ERR is already a Low->High verb, so this needs no new protocol.
+  sendResponse("ERR:REBOOT");
 
   Serial.println("Low-Level Arduino Uno KMS Controller Initialized.");
   if (VERBOSE_LOG) {
