@@ -43,6 +43,13 @@
 //     system that knows how many steps a slot is worth.
 #include "rack_geometry.h"
 
+// --- Home Switch (slot 1 reference) ---
+//     Mechanical limit switch wired NC-to-GND with INPUT_PULLUP, so the pin
+//     reads HIGH when clear and LOW when the switch is pressed at slot 1.
+#define HOME_SWITCH_PIN 5
+#define HOME_SWITCH_ACTIVE_STATE LOW
+#define HOME_SEEK_SPEED 800.0 // steps/sec, slower than normal moves for a clean stop
+
 // --- Solenoid Relay ---
 #define SOLENOID_RELAY_PIN 4 // Digital pin for relay module
 
@@ -64,6 +71,8 @@
     GOTO:<position>    Move stepper to <position> (in steps)
     ANGLE:<degrees>    Move stepper to <degrees> (converted to steps)
     ACTUATE:<1/0>      Engage(1) or Disengage(0) the solenoid
+    HOME:?             Seek the home switch and zero position at slot 1
+    SWITCH:?           Raw home-switch pin read (bench-check wiring/polarity)
     BATT:?             Request battery percentage
     STATUS:?           Request system status
 
@@ -75,7 +84,7 @@
     STATUS:<state>     Status response (IDLE, MOVING, ERROR)
 */
 
-enum SystemState { STATE_IDLE, STATE_MOVING, STATE_ERROR };
+enum SystemState { STATE_IDLE, STATE_MOVING, STATE_ERROR, STATE_HOMING };
 
 // =====================================================================
 //  STEPPER CONTROLLER CLASS  (was StepperController.h/.cpp)
@@ -98,7 +107,53 @@ public:
 
     // Set minimum pulse width for TB6600 (needs >=2.5us)
     motor.setMinPulseWidth(5);
+
+    pinMode(HOME_SWITCH_PIN, INPUT_PULLUP);
   }
+
+  // True while the home switch is physically pressed.
+  bool atHomeSwitch() {
+    return digitalRead(HOME_SWITCH_PIN) == HOME_SWITCH_ACTIVE_STATE;
+  }
+
+  // Begin seeking the home switch: crawl backward (negative direction) at a
+  // reduced speed until the switch triggers. Call updateHoming() each loop
+  // iteration to know when it has arrived (or failed to).
+  void startHoming() {
+    savedMaxSpeed = motor.maxSpeed();
+    motor.setMaxSpeed(HOME_SEEK_SPEED);
+    homingStartPosition = motor.currentPosition();
+    // The switch sits somewhere within one revolution of any starting point,
+    // so one revolution plus a small margin is the whole search space. This
+    // used to move a full 2 revolutions unconditionally and only stopped
+    // when the switch tripped — if it never tripped (bad wiring, wrong
+    // polarity), the rack silently spun two full turns instead of erroring.
+    motor.moveTo(homingStartPosition - (long)(STEPS_PER_REV * 1.1));
+  }
+
+  // Call every loop while homing is in progress. Returns true once the
+  // switch has been reached and the position has been zeroed to slot 1.
+  // Sets homingFailed if the search distance is exhausted without a trigger.
+  bool updateHoming() {
+    if (atHomeSwitch()) {
+      motor.moveTo(motor.currentPosition()); // cancel remaining travel
+      motor.setCurrentPosition(0);
+      motor.setMaxSpeed(savedMaxSpeed);
+      homingFailed = false;
+      return true;
+    }
+    if (motor.distanceToGo() == 0) {
+      // Ran out of travel without ever seeing the switch — stop here rather
+      // than reporting success at some arbitrary position.
+      motor.setMaxSpeed(savedMaxSpeed);
+      homingFailed = true;
+      return true;
+    }
+    motor.run();
+    return false;
+  }
+
+  bool didHomingFail() { return homingFailed; }
 
   void moveTo(long targetPosition) { motor.moveTo(targetPosition); }
 
@@ -138,6 +193,9 @@ public:
 
 private:
   AccelStepper motor;
+  float savedMaxSpeed = STEPPER_MAX_SPEED;
+  long homingStartPosition = 0;
+  bool homingFailed = false;
 };
 
 // =====================================================================
@@ -350,12 +408,36 @@ void processCommand(String cmd) {
     Serial.print(StepperController::angleToSteps(degrees));
     Serial.println(")");
 
+  } else if (command == "HOME") {
+    if (stepper.atHomeSwitch()) {
+      // Already sitting on the switch: zero immediately, nothing to seek.
+      stepper.startHoming();
+      stepper.updateHoming();
+      currentState = STATE_IDLE;
+      sendResponse("DONE:HOME");
+    } else {
+      stepper.startHoming();
+      currentState = STATE_HOMING;
+      sendResponse("ACK:HOME");
+    }
+    Serial.println("Homing to slot 1 switch...");
+
   } else if (command == "ACTUATE") {
     bool engage = (param.toInt() == 1);
     solenoid.actuate(engage);
     sendResponse("ACK:ACTUATE");
     Serial.print("Solenoid Actuated: ");
     Serial.println(engage);
+
+  } else if (command == "SWITCH") {
+    // Raw home-switch read, independent of homing logic — for bench-checking
+    // wiring/polarity before trusting HOME:?. Press the switch by hand and
+    // watch this value change; if it never does, the fault is electrical
+    // (wiring or HOME_SWITCH_ACTIVE_STATE), not the homing routine.
+    bool pressed = stepper.atHomeSwitch();
+    sendResponse("SWITCH:" + String(pressed ? 1 : 0));
+    Serial.print("Home switch raw state — pressed: ");
+    Serial.println(pressed);
 
   } else if (command == "BATT") {
     int percent = battery.getPercentage();
@@ -367,6 +449,8 @@ void processCommand(String cmd) {
       stateStr = "IDLE";
     else if (currentState == STATE_MOVING)
       stateStr = "MOVING";
+    else if (currentState == STATE_HOMING)
+      stateStr = "HOMING";
     else
       stateStr = "ERROR";
     sendResponse("STATUS:" + stateStr);
@@ -395,17 +479,18 @@ void setup() {
   Serial.println("Low-Level Arduino Uno KMS Controller Initialized.");
   if (VERBOSE_LOG) {
     Serial.println("Listening on BOTH the ESP32 link and this USB monitor.");
-    Serial.println("Try: SLOT:7, GOTO:100, ANGLE:90, ACTUATE:1, BATT:?, STATUS:?");
+    Serial.println("Try: SLOT:7, GOTO:100, ANGLE:90, ACTUATE:1, HOME:?, SWITCH:?, BATT:?, STATUS:?");
     Serial.print("Slots: ");
     Serial.print(SLOT_COUNT);
     Serial.print("   Steps/rev: ");
     Serial.print(STEPS_PER_REV);
     Serial.print("   Steps/slot: ");
     Serial.println((float)STEPS_PER_REV / SLOT_COUNT);
-    // Position is step-counted from wherever the board powered up. Without a
-    // home switch there is nothing to check that against, so say so out loud
-    // rather than let a post-reset run quietly hand out the wrong key.
-    Serial.println("WARNING: no home switch — slot 1 is wherever the rack was at boot.");
+    // Position is step-counted from wherever the board powered up. A home
+    // switch at slot 1 exists now (HOME_SWITCH_PIN), but it is only consulted
+    // when HOME:? is sent — send it once after every power-up before trusting
+    // SLOT moves, or a stale in-memory position will hand out the wrong key.
+    Serial.println("Send HOME:? once at startup to zero position at the slot 1 switch.");
   }
 }
 
@@ -424,7 +509,20 @@ void loop() {
   usbLineBuffer.feed(Serial, processCommand);
 
   // 2. Update hardware controllers (non-blocking)
-  stepper.update();
+  if (currentState == STATE_HOMING) {
+    if (stepper.updateHoming()) {
+      currentState = stepper.didHomingFail() ? STATE_ERROR : STATE_IDLE;
+      if (stepper.didHomingFail()) {
+        sendResponse("ERR:HOME_SWITCH_NOT_FOUND");
+        Serial.println("Homing failed: switch never triggered within one revolution.");
+      } else {
+        sendResponse("DONE:HOME");
+        Serial.println("Home switch reached, position zeroed.");
+      }
+    }
+  } else {
+    stepper.update();
+  }
   solenoid.update();
 
   // 3. State management - detect when stepper finishes.
