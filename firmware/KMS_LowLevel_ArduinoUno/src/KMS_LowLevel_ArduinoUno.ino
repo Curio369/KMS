@@ -267,6 +267,28 @@ void sendResponse(const String &msg) {
 //  COMMAND PROCESSOR
 // =====================================================================
 
+// Accumulates bytes from a Stream into a line buffer until '\n', with no
+// timeout — a command may arrive one keystroke at a time, arbitrarily slowly
+// (e.g. a human typing into the Serial Monitor), and must still be processed
+// as a whole line rather than split wherever a pause happened to land.
+struct LineBuffer {
+  String data;
+  void feed(Stream &port, void (*onLine)(String)) {
+    while (port.available()) {
+      char c = (char)port.read();
+      if (c == '\n') {
+        onLine(data);
+        data = "";
+      } else if (c != '\r') {
+        if (data.length() < 63) data += c;
+      }
+    }
+  }
+};
+
+LineBuffer commLineBuffer;
+LineBuffer usbLineBuffer;
+
 void processCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0)
@@ -285,6 +307,7 @@ void processCommand(String cmd) {
     command = cmd.substring(0, separatorIndex);
     param = cmd.substring(separatorIndex + 1);
   }
+  command.toUpperCase();
 
   if (command == "SLOT") {
     // param.toInt() maps anything non-numeric to 0, so an out-of-range check
@@ -397,12 +420,8 @@ void loop() {
   //    how you bench-test without an ESP32 attached. There is no flag to get
   //    wrong: type "SLOT:7" into the Serial Monitor and it works, and the
   //    ESP32 sending the same line works at the same time.
-  if (commSerial.available()) {
-    processCommand(commSerial.readStringUntil('\n'));
-  }
-  if (Serial.available()) {
-    processCommand(Serial.readStringUntil('\n'));
-  }
+  commLineBuffer.feed(commSerial, processCommand);
+  usbLineBuffer.feed(Serial, processCommand);
 
   // 2. Update hardware controllers (non-blocking)
   stepper.update();
